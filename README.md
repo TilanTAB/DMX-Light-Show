@@ -163,40 +163,27 @@ For the uDMX adapter to work on Windows, you need the **libusb** driver:
 
 ## ▶️ Running the Application
 
-You need **two terminals** running simultaneously:
+### Quick Start (Recommended)
 
-### Terminal 1 — Backend API Server
+**Double-click `start.bat`** — it starts both servers, opens the browser, and waits.
+Press any key in the console window to **shut down** both servers cleanly.
 
+If the console window was closed without pressing a key, run **`stop.bat`** to kill any leftover processes.
+
+### Manual Start (Two Terminals)
+
+**Terminal 1 — Backend:**
 ```bash
-# From project root
 .venv\Scripts\python.exe app.py
 ```
 
-You should see:
-```
-==================================================
-  DMX Show Manager API (FastAPI)
-  API:  http://localhost:8000/api/shows
-  Docs: http://localhost:8000/docs
-==================================================
-```
-
-### Terminal 2 — Frontend Dev Server
-
+**Terminal 2 — Frontend:**
 ```bash
 cd frontend
 npx vite
 ```
 
-You should see:
-```
-  VITE v6.x.x  ready in xxxms
-  ➜  Local:   http://localhost:5173/
-```
-
-### Open the App
-
-Navigate to **http://localhost:5173** in your browser.
+Then open **http://localhost:5173** in your browser.
 
 ---
 
@@ -242,6 +229,8 @@ If you paste a URL that already has a show:
 
 ```
 DMX-Light-Show/
+├── start.bat               # One-click launcher (starts both servers + opens browser)
+├── stop.bat                # Emergency shutdown (kills servers by port)
 ├── app.py                  # FastAPI REST API (show library, generation, playback)
 ├── youtube_analyzer.py     # Audio pipeline: download → FFT analysis → AI call → save
 ├── llm_designer.py         # Azure OpenAI prompt engineering for lighting design
@@ -249,21 +238,15 @@ DMX-Light-Show/
 ├── .env.example            # Template for Azure credentials (copy to .env)
 ├── .gitignore              # Excludes secrets, binaries, audio files, logs
 │
-├── frontend/               # React UI (Vite)
-│   ├── src/
-│   │   ├── App.jsx         # Main component: library, controls, generator
-│   │   ├── api.js          # API service layer (all fetch calls)
-│   │   ├── index.css       # Dark glassmorphism design system
-│   │   └── main.jsx        # React entry point
-│   ├── index.html          # HTML shell
-│   ├── vite.config.js      # Vite configuration
-│   └── package.json        # Node dependencies
-│
-├── test_dmx.py             # Hardware test: cycles through RGB on uDMX
-├── test_azure.py           # Connectivity test: verifies Azure OpenAI access
-├── test_hello_world.py     # Basic DMX write test
-├── test_white.py           # Full white output test
-└── test_media.py           # Audio playback test
+└── frontend/               # React UI (Vite)
+    ├── src/
+    │   ├── App.jsx         # Main component: library, controls, generator
+    │   ├── api.js          # API service layer (all fetch calls)
+    │   ├── index.css       # Dark glassmorphism design system
+    │   └── main.jsx        # React entry point
+    ├── index.html          # HTML shell
+    ├── vite.config.js      # Vite configuration
+    └── package.json        # Node dependencies
 ```
 
 ---
