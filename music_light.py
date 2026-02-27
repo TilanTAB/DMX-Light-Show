@@ -39,7 +39,7 @@ HIHAT_GAIN = 3.0
 # Beat detection
 ONSET_COOLDOWN = 0.12
 AGC_SPEED = 0.015
-LOOPBACK_GAIN_BOOST = 5.0   # Loopback audio is much quieter than WAV
+LOOPBACK_GAIN_BOOST = 50.0  # WASAPI loopback is extremely quiet (~0.002 vol)
 LOOPBACK_VOLUME_GATE = 0.00005  # Near-zero gate — if there's any audio, process it
 LOOPBACK_AGC_THRESH = 0.3   # Lower AGC threshold for loopback (vs 0.7 for synced)
 
@@ -510,15 +510,13 @@ class DMXEngine:
     def _render_loopback_direct(self, kick_mag, snare_mag, mid_mag, hihat_mag,
                                 kick_i, snare_i, hihat_i, mid_i,
                                 is_kick, is_snare,
-                                color_1, color_2, volume, t):
+                                color_1, color_2, volume, t, color_idx=0):
         """
-        Concert-style loopback renderer.
-        Philosophy: DARKNESS is the design. Beats PUNCH through the dark.
-        One color per hit. Aggressive decay between beats.
+        Single-channel color cycling loopback renderer.
+        Cycles: Red → Blue → Green → White on each beat.
+        Only ONE color active at a time.
         """
-        # Peak tracking for auto-gain normalization
         self.peak_kick = max(kick_mag, self.peak_kick * 0.97)
-        self.peak_snare = max(snare_mag, self.peak_snare * 0.97)
         self.peak_mid = max(mid_mag, self.peak_mid * 0.97)
 
         def norm(val, peak):
@@ -529,58 +527,46 @@ class DMXEngine:
         bass = norm(kick_mag, self.peak_kick)
         mids = norm(mid_mag, self.peak_mid)
 
-        # ── STRONG BEAT: Full blast with color ──
-        if is_kick:
-            self.out_r = color_1[0]
-            self.out_g = color_1[1]
-            self.out_b = color_1[2]
-            self.out_w = 220.0
+        # color_idx: 0=Red, 1=Blue, 2=Green, 3=White (passed in from caller)
+
+        # ── BEAT: Full blast, single color ──
+        if is_kick or is_snare:
+            self.out_r = 255.0 if color_idx == 0 else 0
+            self.out_g = 255.0 if color_idx == 2 else 0
+            self.out_b = 255.0 if color_idx == 1 else 0
+            self.out_w = 255.0 if color_idx == 3 else 0
             self.out_master = 255.0
             self.out_strobe = 0
             self.beat_hold_frames = 4
-            self.beat_hold_color = color_1
-            return
-
-        if is_snare:
-            self.out_r = color_2[0]
-            self.out_g = color_2[1]
-            self.out_b = color_2[2]
-            self.out_w = 150.0
-            self.out_master = 255.0
-            self.out_strobe = 0
-            self.beat_hold_frames = 3
-            self.beat_hold_color = color_2
             return
 
         # ── HOLD after beat ──
         if self.beat_hold_frames > 0:
             self.beat_hold_frames -= 1
-            c = self.beat_hold_color
-            self.out_r = c[0]
-            self.out_g = c[1]
-            self.out_b = c[2]
-            self.out_w = max(self.out_w * 0.85, 30)
+            # Keep same single color, fade white slightly
+            self.out_w = self.out_w * 0.85
             self.out_master = 255.0
             self.out_strobe = 0
             return
 
-        # ── NO BEAT: Energy-driven dim glow ──
-        # Bass drives brightness between 10% and 50%
-        glow = 0.10 + bass * 0.40  # Range: 10% to 50%
+        # ── BETWEEN BEATS: Very subtle glow, single color only ──
+        bass_active = bass > 0.55  # Higher threshold — ignore slight sounds
 
-        target_r = color_1[0] * glow
-        target_g = color_1[1] * glow
-        target_b = color_1[2] * glow
-        target_w = bass * 40
-        target_m = max(30, glow * 200)
+        if bass_active:
+            glow = (bass - 0.55) * 0.4  # Only the excess above threshold
+            self.out_r = 255.0 * glow if color_idx == 0 else 0
+            self.out_g = 255.0 * glow if color_idx == 2 else 0
+            self.out_b = 255.0 * glow if color_idx == 1 else 0
+            self.out_w = 255.0 * glow if color_idx == 3 else 0
+            self.out_master = max(15, glow * 180)
+        else:
+            # Silence — fade to black
+            self.out_r *= 0.75
+            self.out_g *= 0.75
+            self.out_b *= 0.75
+            self.out_w *= 0.75
+            self.out_master *= 0.75
 
-        # Smooth 20% decay — visible but not stuck
-        decay = 0.20
-        self.out_r = self.out_r + (target_r - self.out_r) * decay
-        self.out_g = self.out_g + (target_g - self.out_g) * decay
-        self.out_b = self.out_b + (target_b - self.out_b) * decay
-        self.out_w = self.out_w + (target_w - self.out_w) * decay
-        self.out_master = self.out_master + (target_m - self.out_master) * decay
         self.out_strobe = 0
 
     # ============================================================
@@ -680,6 +666,7 @@ class DMXEngine:
         if is_loopback and self.frame_counter <= 50 and self.frame_counter % 10 == 0:
             logger.debug(f"[LOOPBACK frame {self.frame_counter}] vol={volume:.6f} samples={len(mono)} sr={sr}")
 
+
         vol_gate = LOOPBACK_VOLUME_GATE if is_loopback else MIN_VOLUME_GATE
         if volume < vol_gate:
             self.out_r *= 0.92; self.out_g *= 0.92; self.out_b *= 0.92
@@ -729,20 +716,26 @@ class DMXEngine:
 
         # --- Beat registration ---
         current_time = time.time()
-        kick_thresh = 0.12 if is_loopback else 0.3
-        snare_thresh = 0.15 if is_loopback else 0.35
+        kick_thresh = 0.05 if is_loopback else 0.3
+        snare_thresh = 0.08 if is_loopback else 0.35
 
         is_kick = kick_i > kick_thresh and (current_time - self.last_beat_time) > ONSET_COOLDOWN
         is_snare = snare_i > snare_thresh and (current_time - self.last_beat_time) > ONSET_COOLDOWN
+
+        # Periodic diagnostic logging every 100 frames
+        if is_loopback and self.frame_counter % 100 == 0:
+            logger.info(f"[DIAG] vol={volume:.4f} kick_i={kick_i:.4f} thresh={kick_thresh:.2f} is_kick={is_kick} beats={self.total_beat_count}")
 
         if is_kick or is_snare:
             self.last_beat_time = current_time
             self.beat_timestamps.append(current_time)
             self.total_beat_count += 1
 
-            rotation_interval = 16 if self.energy_state == "high" else 32
-            if self.total_beat_count % rotation_interval == 0:
-                self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
+            # Only rotate palette in synced mode — loopback has its own R→B→G→W rotation
+            if not is_loopback:
+                rotation_interval = 16 if self.energy_state == "high" else 32
+                if self.total_beat_count % rotation_interval == 0:
+                    self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
 
         self.beat_timestamps = [t for t in self.beat_timestamps if current_time - t < 3.0]
         beats_per_sec = len(self.beat_timestamps) / 3.0
@@ -754,16 +747,16 @@ class DMXEngine:
             # Use direct energy-to-light mapping for maximum responsiveness.
             t = self.frame_counter * BLOCK_SIZE / sr
 
-            # Rotate palette every 8 kicks (creative color changes on beats)
-            if is_kick and self.total_beat_count % 8 == 0:
-                self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
+            # Color cycles every 3 seconds: R → B → G → W (time-based, reliable)
+            import math
+            color_phase = int(t / 3.0) % 4
 
             kick_color, accent_color = self.palettes[self.current_palette_idx]
             self._render_loopback_direct(
                 kick_mag, snare_mag, mid_mag, hihat_mag,
                 kick_i, snare_i, hihat_i, mid_i,
                 is_kick, is_snare,
-                kick_color, accent_color, volume, t
+                kick_color, accent_color, volume, t, color_phase
             )
         else:
             if self.synced_cues:
