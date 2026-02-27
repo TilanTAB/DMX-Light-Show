@@ -143,6 +143,10 @@ class DMXEngine:
         self.last_palette_rotate = 0.0
         self.beat_hold_frames = 0  # Hold full brightness for N frames after beat
         self.beat_hold_color = (255, 0, 50)  # Which color to hold
+        self.prev_bps = 0.0          # Previous beats-per-second for rhythm change detection
+        self.bps_check_time = 0.0    # Last time we checked BPS
+        self.color_phase = 0         # Current R/B/G/W phase
+        self.last_color_change = 0.0 # Time of last color change
 
         # Playback control state (IPC via files)
         self.playback_position = 0.0
@@ -512,9 +516,9 @@ class DMXEngine:
                                 is_kick, is_snare,
                                 color_1, color_2, volume, t, color_idx=0):
         """
-        Single-channel color cycling loopback renderer.
-        Cycles: Red → Blue → Green → White on each beat.
-        Only ONE color active at a time.
+        Loopback renderer with rhythm-aware color cycling and deep bass combos.
+        - Colors cycle on rhythm changes (tempo shifts, breaks, fills)
+        - Deep bass hits trigger dual-color combos (purple, cyan, yellow)
         """
         self.peak_kick = max(kick_mag, self.peak_kick * 0.97)
         self.peak_mid = max(mid_mag, self.peak_mid * 0.97)
@@ -527,9 +531,28 @@ class DMXEngine:
         bass = norm(kick_mag, self.peak_kick)
         mids = norm(mid_mag, self.peak_mid)
 
-        # color_idx: 0=Red, 1=Blue, 2=Green, 3=White (passed in from caller)
+        # Deep bass detection: kick_mag > 80% of peak = a HEAVY hit
+        is_deep_bass = self.peak_kick > 0.00001 and (kick_mag / self.peak_kick) > 0.80
 
-        # ── BEAT: Full blast, single color ──
+        # ── DEEP BASS COMBO: Dual-color blast ──
+        if (is_kick or is_snare) and is_deep_bass:
+            # Combos cycle: R+B (purple), R+G (yellow), B+G (cyan), R+G+B (white)
+            combo = color_idx % 4
+            if combo == 0:
+                self.out_r = 255.0; self.out_b = 200.0; self.out_g = 0  # Purple
+            elif combo == 1:
+                self.out_r = 255.0; self.out_g = 200.0; self.out_b = 0  # Yellow
+            elif combo == 2:
+                self.out_b = 255.0; self.out_g = 200.0; self.out_r = 0  # Cyan
+            else:
+                self.out_r = 200.0; self.out_g = 200.0; self.out_b = 200.0  # White
+            self.out_w = 255.0
+            self.out_master = 255.0
+            self.out_strobe = 0
+            self.beat_hold_frames = 5  # Extra hold for big hits
+            return
+
+        # ── NORMAL BEAT: Single color blast ──
         if is_kick or is_snare:
             self.out_r = 255.0 if color_idx == 0 else 0
             self.out_g = 255.0 if color_idx == 2 else 0
@@ -543,24 +566,22 @@ class DMXEngine:
         # ── HOLD after beat ──
         if self.beat_hold_frames > 0:
             self.beat_hold_frames -= 1
-            # Keep same single color, fade white slightly
             self.out_w = self.out_w * 0.85
             self.out_master = 255.0
             self.out_strobe = 0
             return
 
-        # ── BETWEEN BEATS: Very subtle glow, single color only ──
-        bass_active = bass > 0.55  # Higher threshold — ignore slight sounds
+        # ── BETWEEN BEATS: Subtle glow ──
+        bass_active = bass > 0.55
 
         if bass_active:
-            glow = (bass - 0.55) * 0.4  # Only the excess above threshold
+            glow = (bass - 0.55) * 0.4
             self.out_r = 255.0 * glow if color_idx == 0 else 0
             self.out_g = 255.0 * glow if color_idx == 2 else 0
             self.out_b = 255.0 * glow if color_idx == 1 else 0
             self.out_w = 255.0 * glow if color_idx == 3 else 0
             self.out_master = max(15, glow * 180)
         else:
-            # Silence — fade to black
             self.out_r *= 0.75
             self.out_g *= 0.75
             self.out_b *= 0.75
@@ -743,13 +764,30 @@ class DMXEngine:
         # --- Determine cue/behavior ---
         cue = None
         if is_loopback:
-            # LOOPBACK: Skip behavior detection entirely.
-            # Use direct energy-to-light mapping for maximum responsiveness.
+            # LOOPBACK: Direct energy-to-light with rhythm-aware color cycling.
             t = self.frame_counter * BLOCK_SIZE / sr
 
-            # Color cycles every 3 seconds: R → B → G → W (time-based, reliable)
-            import math
-            color_phase = int(t / 3.0) % 4
+            # ── Rhythm-change color cycling ──
+            # Compare recent BPS to previous BPS. Change color on rhythm shifts.
+            if current_time - self.bps_check_time > 2.0:  # Check every 2 seconds
+                bps_change = abs(beats_per_sec - self.prev_bps)
+                bps_threshold = max(0.5, self.prev_bps * 0.30)  # 30% change
+
+                if bps_change > bps_threshold and self.prev_bps > 0:
+                    # Rhythm changed! (fill, break, chorus drop) → advance color
+                    self.color_phase = (self.color_phase + 1) % 4
+                    self.last_color_change = current_time
+                    logger.info(f"[RHYTHM] BPS {self.prev_bps:.1f} → {beats_per_sec:.1f} | Color → {['R','B','G','W'][self.color_phase]}")
+
+                self.prev_bps = beats_per_sec
+                self.bps_check_time = current_time
+
+            # Fallback: if no rhythm change for 5s, advance anyway
+            if current_time - self.last_color_change > 5.0:
+                self.color_phase = (self.color_phase + 1) % 4
+                self.last_color_change = current_time
+
+            color_phase = self.color_phase
 
             kick_color, accent_color = self.palettes[self.current_palette_idx]
             self._render_loopback_direct(
