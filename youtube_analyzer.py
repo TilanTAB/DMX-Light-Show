@@ -267,7 +267,7 @@ def analyze_audio_structure(filepath):
             elif section_rms < avg_rms * 0.75:
                 section_type = "Verse/Breakdown"
             elif section_rms < avg_rms * 1.2:
-                section_type = "Pre-Chorus/Build-up"
+                section_type = "Bridge/Hook"
             else:
                 section_type = "Chorus/Drop"
             

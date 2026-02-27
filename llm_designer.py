@@ -97,7 +97,7 @@ Analyze the telemetry and pick the BEST behavior for each section:
   FEEL: Intense but not chaotic. Controlled energy.
 
 "buildup_ramp" — Brightness ramps 20%→100% over the section duration. Strobe increases.
-  USE FOR: Pre-chorus, pre-drop buildups. CRITICAL for tension.
+  USE FOR: Tension-building moments before a big drop.
   FEEL: Anticipation. The audience knows something big is coming.
 
 "strobe_blast" — Full white strobe at maximum rate. Use VERY SPARINGLY (max 4-8 seconds).
@@ -112,11 +112,11 @@ Analyze the telemetry and pick the BEST behavior for each section:
 A well-designed show follows this emotional curve:
   Intro: slow_breathe (dim, mysterious)
   → Verse 1: static_wash (warm, focused)
-  → Pre-Chorus: buildup_ramp (rising tension!)
+  → Bridge: buildup_ramp (rising tension!)
   → Chorus 1: bass_white_blast (IMPACT! White on kicks!)
   → Post-Chorus: beat_reactive (ride the energy)
   → Verse 2: static_wash (contrast: pull back)
-  → Pre-Chorus 2: buildup_ramp (tension again)
+  → Hook: buildup_ramp (tension again)
   → Chorus 2: blackout_punch (even MORE intense than Chorus 1!)
   → Bridge/Breakdown: slow_breathe (dramatic contrast, reset)
   → Final Chorus: strobe_blast 2s → bass_white_blast (ultimate climax)

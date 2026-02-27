@@ -66,8 +66,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SHOWS_DIR = os.path.join(BASE_DIR, "shows")
 AUDIO_DIR = os.path.join(BASE_DIR, "youtube_audio")
 PYTHON_EXE = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
+PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
 
 os.makedirs(SHOWS_DIR, exist_ok=True)
+os.makedirs(PROFILES_DIR, exist_ok=True)
 
 # ==========================================
 # GLOBAL STATE (process tracking)
@@ -98,6 +100,7 @@ class PlayRequest(BaseModel):
 
 class LoopbackRequest(BaseModel):
     show_id: str | None = None
+    profile_id: str | None = None
 
 class SeekRequest(BaseModel):
     position: float  # Seconds to seek to
@@ -600,11 +603,16 @@ def start_loopback(req: LoopbackRequest):
     cmd = [PYTHON_EXE, "music_light.py", "--mode", "loopback"]
 
     if req.show_id:
-        # FIX #4: Path traversal protection
         show_dir = _resolve_show_path(req.show_id)
         show_file = os.path.join(show_dir, "show.json")
         if os.path.isfile(show_file):
             cmd.extend(["--show", show_file])
+
+    # Add profile if specified
+    if req.profile_id:
+        profile_path = os.path.join(PROFILES_DIR, req.profile_id + ".json")
+        if os.path.isfile(profile_path):
+            cmd.extend(["--profile", profile_path])
 
     with _active_lock:
         _kill_active_process()
@@ -713,6 +721,94 @@ def delete_show(show_id: str):
     shutil.rmtree(show_dir)
     return {"message": f"Show '{show_id}' deleted."}
 
+
+# ==========================================
+# PROFILE ENDPOINTS
+# ==========================================
+
+@app.get("/api/profiles")
+def list_profiles():
+    """List all available lighting profiles."""
+    profiles = []
+    if os.path.isdir(PROFILES_DIR):
+        for fname in sorted(os.listdir(PROFILES_DIR)):
+            if fname.endswith(".json"):
+                fpath = os.path.join(PROFILES_DIR, fname)
+                try:
+                    with open(fpath, 'r') as f:
+                        data = json.load(f)
+                    profiles.append({
+                        "id": fname.replace(".json", ""),
+                        "name": data.get("name", fname),
+                        "description": data.get("description", ""),
+                    })
+                except Exception:
+                    profiles.append({"id": fname.replace(".json", ""), "name": fname, "description": "Error reading profile"})
+    return {"profiles": profiles}
+
+
+@app.get("/api/profiles/{profile_id}")
+def get_profile(profile_id: str):
+    """Get full profile details."""
+    # Prevent path traversal
+    if "/" in profile_id or "\\" in profile_id or ".." in profile_id:
+        raise HTTPException(400, "Invalid profile ID")
+    fpath = os.path.join(PROFILES_DIR, profile_id + ".json")
+    if not os.path.isfile(fpath):
+        raise HTTPException(404, f"Profile '{profile_id}' not found")
+    with open(fpath, 'r') as f:
+        return json.load(f)
+
+
+@app.post("/api/profiles")
+def save_profile(profile: dict):
+    """Save or update a profile. Body must include 'name'."""
+    name = profile.get("name")
+    if not name:
+        raise HTTPException(400, "Profile must have a 'name' field")
+    # Create a safe filename from the name
+    safe_id = re.sub(r'[^a-z0-9_]', '_', name.lower().strip()).strip('_')
+    if not safe_id:
+        raise HTTPException(400, "Profile name produces invalid ID")
+    fpath = os.path.join(PROFILES_DIR, safe_id + ".json")
+    with open(fpath, 'w') as f:
+        json.dump(profile, f, indent=2)
+    return {"message": f"Profile '{name}' saved.", "id": safe_id}
+
+
+@app.delete("/api/profiles/{profile_id}")
+def delete_profile(profile_id: str):
+    """Delete a profile."""
+    if "/" in profile_id or "\\" in profile_id or ".." in profile_id:
+        raise HTTPException(400, "Invalid profile ID")
+    fpath = os.path.join(PROFILES_DIR, profile_id + ".json")
+    if not os.path.isfile(fpath):
+        raise HTTPException(404, f"Profile '{profile_id}' not found")
+    os.remove(fpath)
+    return {"message": f"Profile '{profile_id}' deleted."}
+
+
+@app.post("/api/profiles/{profile_id}/activate")
+def activate_profile(profile_id: str):
+    """Set active profile and restart loopback with it."""
+    if "/" in profile_id or "\\" in profile_id or ".." in profile_id:
+        raise HTTPException(400, "Invalid profile ID")
+    profile_path = os.path.join(PROFILES_DIR, profile_id + ".json")
+    if not os.path.isfile(profile_path):
+        raise HTTPException(404, f"Profile '{profile_id}' not found")
+
+    # Restart loopback with this profile
+    cmd = [PYTHON_EXE, "music_light.py", "--mode", "loopback", "--profile", profile_path]
+
+    with _active_lock:
+        _kill_active_process()
+        global _active_process
+        _active_process = subprocess.Popen(cmd, cwd=BASE_DIR)
+
+    with open(profile_path, 'r') as f:
+        profile_name = json.load(f).get("name", profile_id)
+
+    return {"message": f"Profile '{profile_name}' activated.", "pid": _active_process.pid}
 
 # ==========================================
 # STARTUP

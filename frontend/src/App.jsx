@@ -12,6 +12,8 @@ import {
   seekPlayback,
   pausePlayback,
   resumePlayback,
+  getProfiles,
+  activateProfile,
 } from "./api";
 
 // ==========================================
@@ -74,6 +76,10 @@ export default function App() {
   const [behavior, setBehavior] = useState("");
   const [isSeeking, setIsSeeking] = useState(false);
 
+  // Profile state
+  const [profiles, setProfiles] = useState([]);
+  const [activeProfile, setActiveProfile] = useState("concert_punchy");
+
   const pollRef = useRef(null);
   const timerRef = useRef(null);
   const toastTimer = useRef(null);
@@ -93,6 +99,12 @@ export default function App() {
       setShows(data);
     } catch (err) {
       console.error("Failed to load shows:", err);
+    }
+    try {
+      const pdata = await getProfiles();
+      setProfiles(pdata.profiles || []);
+    } catch (err) {
+      console.error("Failed to load profiles:", err);
     }
   }, []);
 
@@ -243,11 +255,24 @@ export default function App() {
   // ── Handle Loopback Mode ──
   const handleLoopback = async (showId = null) => {
     try {
-      await startLoopback(showId);
+      await startLoopback(showId, activeProfile);
       setIsPlaying(true);
-      showToast("🎧 Loopback mode active — play any audio!");
+      showToast(`🎧 Loopback active — Profile: ${profiles.find(p => p.id === activeProfile)?.name || 'Default'}`);
     } catch (err) {
       showToast(`❌ ${err.message}`);
+    }
+  };
+
+  // ── Handle Profile Switch ──
+  const handleProfileSwitch = async (profileId) => {
+    setActiveProfile(profileId);
+    if (isPlaying) {
+      try {
+        await activateProfile(profileId);
+        showToast(`🎨 Profile: ${profiles.find(p => p.id === profileId)?.name || profileId}`);
+      } catch (err) {
+        showToast(`❌ ${err.message}`);
+      }
     }
   };
 
@@ -440,6 +465,22 @@ export default function App() {
         >
           🎧 Live Loopback Mode
         </button>
+
+        {profiles.length > 0 && (
+          <select
+            id="profile-selector"
+            className="profile-select"
+            value={activeProfile}
+            onChange={(e) => handleProfileSwitch(e.target.value)}
+          >
+            {profiles.map((p) => (
+              <option key={p.id} value={p.id}>
+                🎨 {p.name}
+              </option>
+            ))}
+          </select>
+        )}
+
         {isPlaying && !isPlaying && (
           <button className="btn btn-danger" onClick={handleStop}>
             ⏹ Stop

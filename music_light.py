@@ -145,8 +145,26 @@ class DMXEngine:
         self.beat_hold_color = (255, 0, 50)  # Which color to hold
         self.prev_bps = 0.0          # Previous beats-per-second for rhythm change detection
         self.bps_check_time = 0.0    # Last time we checked BPS
-        self.color_phase = 0         # Current R/B/G/W phase
-        self.last_color_change = 0.0 # Time of last color change
+        self.color_phase = 0
+        self.last_color_change = 0.0
+
+        # Profile-configurable parameters (defaults = Concert Punchy)
+        self.profile_name = "Concert Punchy"
+        self.profile_gain_boost = LOOPBACK_GAIN_BOOST
+        self.profile_volume_gate = LOOPBACK_VOLUME_GATE
+        self.profile_agc_thresh = LOOPBACK_AGC_THRESH
+        self.profile_kick_thresh = 0.05
+        self.profile_snare_thresh = 0.08
+        self.profile_onset_cooldown = ONSET_COOLDOWN
+        self.profile_color_cycle_mode = "rhythm"  # rhythm, time, beat
+        self.profile_color_cycle_interval = 5.0
+        self.profile_rhythm_change_pct = 0.30
+        self.profile_deep_bass_enabled = True
+        self.profile_deep_bass_thresh = 0.80
+        self.profile_decay_speed = 0.75
+        self.profile_glow_thresh = 0.55
+        self.profile_beat_hold = 4
+        self.profile_deep_bass_hold = 5
 
         # Playback control state (IPC via files)
         self.playback_position = 0.0
@@ -174,7 +192,36 @@ class DMXEngine:
         }
 
     # ----------------------------------------------------------
-    # HARDWARE
+    # PROFILE LOADING
+    # ----------------------------------------------------------
+    def load_profile(self, profile_path):
+        """Load a lighting profile from a JSON file."""
+        try:
+            with open(profile_path, 'r') as f:
+                p = json.load(f)
+            self.profile_name = p.get("name", "Unknown")
+            self.profile_gain_boost = p.get("gain_boost", self.profile_gain_boost)
+            self.profile_volume_gate = p.get("volume_gate", self.profile_volume_gate)
+            self.profile_agc_thresh = p.get("agc_thresh", self.profile_agc_thresh)
+            self.profile_kick_thresh = p.get("kick_thresh", self.profile_kick_thresh)
+            self.profile_snare_thresh = p.get("snare_thresh", self.profile_snare_thresh)
+            self.profile_onset_cooldown = p.get("onset_cooldown", self.profile_onset_cooldown)
+            self.profile_color_cycle_mode = p.get("color_cycle_mode", self.profile_color_cycle_mode)
+            self.profile_color_cycle_interval = p.get("color_cycle_interval", self.profile_color_cycle_interval)
+            self.profile_rhythm_change_pct = p.get("rhythm_change_pct", self.profile_rhythm_change_pct)
+            self.profile_deep_bass_enabled = p.get("deep_bass_enabled", self.profile_deep_bass_enabled)
+            self.profile_deep_bass_thresh = p.get("deep_bass_thresh", self.profile_deep_bass_thresh)
+            self.profile_decay_speed = p.get("decay_speed", self.profile_decay_speed)
+            self.profile_glow_thresh = p.get("glow_thresh", self.profile_glow_thresh)
+            self.profile_beat_hold = p.get("beat_hold_frames", self.profile_beat_hold)
+            self.profile_deep_bass_hold = p.get("deep_bass_hold_frames", self.profile_deep_bass_hold)
+            # Load palettes if provided
+            if "palettes" in p:
+                self.palettes = [(tuple(c1), tuple(c2)) for c1, c2 in p["palettes"]]
+            logger.info(f"[PROFILE] Loaded: {self.profile_name}")
+        except Exception as e:
+            logger.error(f"[PROFILE] Failed to load {profile_path}: {e}")
+
     # ----------------------------------------------------------
     def _init_hardware(self):
         """Find uDMX adapter. Raises RuntimeError if not found."""
@@ -531,8 +578,7 @@ class DMXEngine:
         bass = norm(kick_mag, self.peak_kick)
         mids = norm(mid_mag, self.peak_mid)
 
-        # Deep bass detection: kick_mag > 80% of peak = a HEAVY hit
-        is_deep_bass = self.peak_kick > 0.00001 and (kick_mag / self.peak_kick) > 0.80
+        is_deep_bass = self.profile_deep_bass_enabled and self.peak_kick > 0.00001 and (kick_mag / self.peak_kick) > self.profile_deep_bass_thresh
 
         # ── DEEP BASS COMBO: Dual-color blast ──
         if (is_kick or is_snare) and is_deep_bass:
@@ -549,7 +595,7 @@ class DMXEngine:
             self.out_w = 255.0
             self.out_master = 255.0
             self.out_strobe = 0
-            self.beat_hold_frames = 5  # Extra hold for big hits
+            self.beat_hold_frames = self.profile_deep_bass_hold  # Extra hold for big hits
             return
 
         # ── NORMAL BEAT: Single color blast ──
@@ -560,7 +606,7 @@ class DMXEngine:
             self.out_w = 255.0 if color_idx == 3 else 0
             self.out_master = 255.0
             self.out_strobe = 0
-            self.beat_hold_frames = 4
+            self.beat_hold_frames = self.profile_beat_hold
             return
 
         # ── HOLD after beat ──
@@ -572,21 +618,21 @@ class DMXEngine:
             return
 
         # ── BETWEEN BEATS: Subtle glow ──
-        bass_active = bass > 0.55
+        bass_active = bass > self.profile_glow_thresh
 
         if bass_active:
-            glow = (bass - 0.55) * 0.4
+            glow = (bass - self.profile_glow_thresh) * 0.4
             self.out_r = 255.0 * glow if color_idx == 0 else 0
             self.out_g = 255.0 * glow if color_idx == 2 else 0
             self.out_b = 255.0 * glow if color_idx == 1 else 0
             self.out_w = 255.0 * glow if color_idx == 3 else 0
             self.out_master = max(15, glow * 180)
         else:
-            self.out_r *= 0.75
-            self.out_g *= 0.75
-            self.out_b *= 0.75
-            self.out_w *= 0.75
-            self.out_master *= 0.75
+            self.out_r *= self.profile_decay_speed
+            self.out_g *= self.profile_decay_speed
+            self.out_b *= self.profile_decay_speed
+            self.out_w *= self.profile_decay_speed
+            self.out_master *= self.profile_decay_speed
 
         self.out_strobe = 0
 
@@ -688,7 +734,7 @@ class DMXEngine:
             logger.debug(f"[LOOPBACK frame {self.frame_counter}] vol={volume:.6f} samples={len(mono)} sr={sr}")
 
 
-        vol_gate = LOOPBACK_VOLUME_GATE if is_loopback else MIN_VOLUME_GATE
+        vol_gate = self.profile_volume_gate if is_loopback else MIN_VOLUME_GATE
         if volume < vol_gate:
             self.out_r *= 0.92; self.out_g *= 0.92; self.out_b *= 0.92
             self.out_w *= 0.92; self.out_master *= 0.92
@@ -719,13 +765,13 @@ class DMXEngine:
         snare_flux = max(0.0, snare_mag - self.prev_snare_mag)
         hihat_flux = max(0.0, hihat_mag - self.prev_hihat_mag)
 
-        agc_thresh = LOOPBACK_AGC_THRESH if is_loopback else 0.7
+        agc_thresh = self.profile_agc_thresh if is_loopback else 0.7
         kick_hit = max(0.0, kick_mag - self.agc_kick * agc_thresh)
         snare_hit = max(0.0, snare_mag - self.agc_snare * agc_thresh)
         mid_hit = max(0.0, mid_mag - self.agc_mid * 0.4)
         hihat_hit = max(0.0, hihat_mag - self.agc_hihat * 0.4)
 
-        gain_mult = LOOPBACK_GAIN_BOOST if is_loopback else 1.0
+        gain_mult = self.profile_gain_boost if is_loopback else 1.0
         kick_i = min(1.0, (kick_flux * 0.6 + kick_hit * 0.4) * KICK_GAIN * gain_mult)
         snare_i = min(1.0, (snare_flux * 0.6 + snare_hit * 0.4) * SNARE_GAIN * gain_mult)
         hihat_i = min(1.0, (hihat_flux * 0.5 + hihat_hit * 0.5) * HIHAT_GAIN * gain_mult)
@@ -737,11 +783,11 @@ class DMXEngine:
 
         # --- Beat registration ---
         current_time = time.time()
-        kick_thresh = 0.05 if is_loopback else 0.3
-        snare_thresh = 0.08 if is_loopback else 0.35
+        kick_thresh = self.profile_kick_thresh if is_loopback else 0.3
+        snare_thresh = self.profile_snare_thresh if is_loopback else 0.35
 
-        is_kick = kick_i > kick_thresh and (current_time - self.last_beat_time) > ONSET_COOLDOWN
-        is_snare = snare_i > snare_thresh and (current_time - self.last_beat_time) > ONSET_COOLDOWN
+        is_kick = kick_i > kick_thresh and (current_time - self.last_beat_time) > self.profile_onset_cooldown
+        is_snare = snare_i > snare_thresh and (current_time - self.last_beat_time) > self.profile_onset_cooldown
 
         # Periodic diagnostic logging every 100 frames
         if is_loopback and self.frame_counter % 100 == 0:
@@ -764,32 +810,42 @@ class DMXEngine:
         # --- Determine cue/behavior ---
         cue = None
         if is_loopback:
-            # LOOPBACK: Direct energy-to-light with rhythm-aware color cycling.
+            # LOOPBACK: Direct energy-to-light with profile-aware color cycling.
             t = self.frame_counter * BLOCK_SIZE / sr
 
-            # ── Rhythm-change color cycling ──
-            # Compare recent BPS to previous BPS. Change color on rhythm shifts.
-            if current_time - self.bps_check_time > 2.0:  # Check every 2 seconds
-                bps_change = abs(beats_per_sec - self.prev_bps)
-                bps_threshold = max(0.5, self.prev_bps * 0.30)  # 30% change
+            # ── Color cycling based on profile mode ──
+            cycle_mode = self.profile_color_cycle_mode
 
-                if bps_change > bps_threshold and self.prev_bps > 0:
-                    # Rhythm changed! (fill, break, chorus drop) → advance color
+            if cycle_mode == "rhythm":
+                # Rhythm-change detection: advance color on BPS shifts
+                if current_time - self.bps_check_time > 2.0:
+                    bps_change = abs(beats_per_sec - self.prev_bps)
+                    bps_threshold = max(0.5, self.prev_bps * self.profile_rhythm_change_pct)
+
+                    if bps_change > bps_threshold and self.prev_bps > 0:
+                        self.color_phase = (self.color_phase + 1) % 4
+                        self.last_color_change = current_time
+                        logger.info(f"[RHYTHM] BPS {self.prev_bps:.1f} -> {beats_per_sec:.1f} | Color -> {['R','B','G','W'][self.color_phase]}")
+
+                    self.prev_bps = beats_per_sec
+                    self.bps_check_time = current_time
+
+                # Fallback timer
+                if current_time - self.last_color_change > self.profile_color_cycle_interval:
                     self.color_phase = (self.color_phase + 1) % 4
                     self.last_color_change = current_time
-                    logger.info(f"[RHYTHM] BPS {self.prev_bps:.1f} → {beats_per_sec:.1f} | Color → {['R','B','G','W'][self.color_phase]}")
 
-                self.prev_bps = beats_per_sec
-                self.bps_check_time = current_time
+            elif cycle_mode == "time":
+                # Fixed time-based rotation
+                self.color_phase = int(t / self.profile_color_cycle_interval) % 4
 
-            # Fallback: if no rhythm change for 5s, advance anyway
-            if current_time - self.last_color_change > 5.0:
-                self.color_phase = (self.color_phase + 1) % 4
-                self.last_color_change = current_time
+            elif cycle_mode == "beat":
+                # Advance on every 4th beat
+                self.color_phase = (self.total_beat_count // 4) % 4
 
             color_phase = self.color_phase
 
-            kick_color, accent_color = self.palettes[self.current_palette_idx]
+            kick_color, accent_color = self.palettes[self.current_palette_idx % len(self.palettes)]
             self._render_loopback_direct(
                 kick_mag, snare_mag, mid_mag, hihat_mag,
                 kick_i, snare_i, hihat_i, mid_i,
@@ -978,6 +1034,7 @@ class DMXEngine:
 if __name__ == "__main__":
     mode = "synced"
     show_file = "current_show.json"
+    profile_file = None
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -987,14 +1044,20 @@ if __name__ == "__main__":
         elif args[i] == "--show" and i + 1 < len(args):
             show_file = args[i + 1]
             i += 2
+        elif args[i] == "--profile" and i + 1 < len(args):
+            profile_file = args[i + 1]
+            i += 2
         else:
             i += 1
 
     engine = DMXEngine()
 
+    if profile_file:
+        engine.load_profile(profile_file)
+
     try:
         logger.info(f"==== AI Music Light Controller V9 ====")
-        logger.info(f"Mode: {mode.upper()} | Show: {show_file}")
+        logger.info(f"Mode: {mode.upper()} | Show: {show_file} | Profile: {engine.profile_name}")
         if mode == "loopback":
             engine.run_loopback_mode(show_file)
         else:

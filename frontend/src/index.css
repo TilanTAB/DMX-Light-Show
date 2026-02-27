@@ -701,3 +701,33 @@ body::before {
   gap: 8px;
   justify-content: center;
 }
+
+/* ── Profile Selector ── */
+.profile-select {
+  background: var(--surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  min-width: 180px;
+}
+
+.profile-select:hover {
+  border-color: var(--accent-primary);
+}
+
+.profile-select:focus {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.profile-select option {
+  background: var(--bg);
+  color: var(--text-primary);
+  padding: 8px;
+}

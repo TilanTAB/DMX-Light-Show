@@ -61,10 +61,10 @@ export function playShow(showId) {
 }
 
 /** POST /api/loopback → Start live WASAPI loopback mode */
-export function startLoopback(showId = null) {
+export function startLoopback(showId = null, profileId = null) {
     return apiFetch("/api/loopback", {
         method: "POST",
-        body: JSON.stringify({ show_id: showId }),
+        body: JSON.stringify({ show_id: showId, profile_id: profileId }),
     });
 }
 
@@ -126,4 +126,23 @@ export function pausePlayback() {
 /** POST /api/playback/resume → Resume paused playback */
 export function resumePlayback() {
     return apiFetch("/api/playback/resume", { method: "POST" });
+}
+
+// ==========================================
+// PROFILES
+// ==========================================
+
+/** GET /api/profiles → List all profiles */
+export function getProfiles() {
+    return apiFetch("/api/profiles");
+}
+
+/** GET /api/profiles/:id → Get profile details */
+export function getProfile(profileId) {
+    return apiFetch(`/api/profiles/${profileId}`);
+}
+
+/** POST /api/profiles/:id/activate → Activate profile + restart loopback */
+export function activateProfile(profileId) {
+    return apiFetch(`/api/profiles/${profileId}/activate`, { method: "POST" });
 }
