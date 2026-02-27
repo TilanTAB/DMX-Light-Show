@@ -8,16 +8,38 @@ import {
   getStatus,
   generateShow,
   getGenerationStatus,
+  getPlaybackPosition,
+  seekPlayback,
+  pausePlayback,
+  resumePlayback,
 } from "./api";
 
 // ==========================================
 // Helper: Format seconds → "3:56"
 // ==========================================
 function formatDuration(seconds) {
-  if (!seconds) return "0:00";
+  if (!seconds && seconds !== 0) return "0:00";
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// ==========================================
+// Helper: Parse "M:SS" or "MM:SS" to seconds
+// ==========================================
+function parseTimeInput(str) {
+  if (!str || !str.trim()) return null;
+  const cleaned = str.trim();
+  // Accept raw seconds
+  if (/^\d+(\.\d+)?$/.test(cleaned)) return parseFloat(cleaned);
+  // Accept M:SS or MM:SS
+  const parts = cleaned.split(":");
+  if (parts.length === 2) {
+    const m = parseInt(parts[0], 10);
+    const s = parseInt(parts[1], 10);
+    if (!isNaN(m) && !isNaN(s)) return m * 60 + s;
+  }
+  return null;
 }
 
 // ==========================================
@@ -35,19 +57,33 @@ export default function App() {
   const [shows, setShows] = useState([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [url, setUrl] = useState("");
+  const [startTime, setStartTime] = useState("");
+  const [endTime, setEndTime] = useState("");
   const [generating, setGenerating] = useState(false);
   const [genMessage, setGenMessage] = useState("");
   const [genProgress, setGenProgress] = useState(0);
   const [toast, setToast] = useState(null);
-  const [existsDialog, setExistsDialog] = useState(null); // { url, title, show_id }
+  const [existsDialog, setExistsDialog] = useState(null);
   const [genElapsed, setGenElapsed] = useState(0);
+
+  // Playback position state
+  const [playbackPos, setPlaybackPos] = useState(0);
+  const [playbackDuration, setPlaybackDuration] = useState(0);
+  const [playbackState, setPlaybackState] = useState("stopped");
+  const [cueName, setCueName] = useState("");
+  const [behavior, setBehavior] = useState("");
+  const [isSeeking, setIsSeeking] = useState(false);
+
   const pollRef = useRef(null);
   const timerRef = useRef(null);
+  const toastTimer = useRef(null);
+  const positionPollRef = useRef(null);
 
-  // ── Show toast notification ──
+  // ── Show toast notification (with timer cleanup) ──
   const showToast = useCallback((message, duration = 3000) => {
+    clearTimeout(toastTimer.current);
     setToast(message);
-    setTimeout(() => setToast(null), duration);
+    toastTimer.current = setTimeout(() => setToast(null), duration);
   }, []);
 
   // ── Load shows from API ──
@@ -65,10 +101,52 @@ export default function App() {
     try {
       const data = await getStatus();
       setIsPlaying(data.playing);
+
+      // If playing, update position from status endpoint
+      if (data.playing && data.playback && !isSeeking) {
+        setPlaybackPos(data.playback.position || 0);
+        setPlaybackDuration(data.playback.duration || 0);
+        setPlaybackState(data.playback.state || "playing");
+        setCueName(data.playback.cue_name || "");
+        setBehavior(data.playback.behavior || "");
+      } else if (!data.playing) {
+        setPlaybackState("stopped");
+      }
     } catch (err) {
       console.error("Status check failed:", err);
     }
-  }, []);
+  }, [isSeeking]);
+
+  // ── Position polling (faster when playing) ──
+  // FIX #3: Use recursive setTimeout instead of setInterval to prevent 
+  // promise accumulation when the backend is slow.
+  useEffect(() => {
+    if (!isPlaying) return;
+    let cancelled = false;
+
+    async function pollPosition() {
+      if (cancelled || isSeeking) {
+        if (!cancelled) setTimeout(pollPosition, 300);
+        return;
+      }
+      try {
+        const data = await getPlaybackPosition();
+        if (!cancelled) {
+          setPlaybackPos(data.position || 0);
+          setPlaybackDuration(data.duration || 0);
+          setPlaybackState(data.state || "stopped");
+          setCueName(data.cue_name || "");
+          setBehavior(data.behavior || "");
+        }
+      } catch (err) {
+        // Ignore errors during polling
+      }
+      if (!cancelled) setTimeout(pollPosition, 300);
+    }
+
+    pollPosition();
+    return () => { cancelled = true; };
+  }, [isPlaying, isSeeking]);
 
   // ── On mount: load shows + start status polling ──
   useEffect(() => {
@@ -89,13 +167,15 @@ export default function App() {
     setGenProgress(5);
     setGenElapsed(0);
 
-    // Start elapsed time counter
     timerRef.current = setInterval(() => setGenElapsed((t) => t + 1), 1000);
 
-    try {
-      const res = await generateShow(targetUrl.trim(), regenerate);
+    // Parse optional time range
+    const startSec = parseTimeInput(startTime);
+    const endSec = parseTimeInput(endTime);
 
-      // API says "this show already exists" — ask user
+    try {
+      const res = await generateShow(targetUrl.trim(), regenerate, startSec, endSec);
+
       if (res.status === "exists") {
         setGenerating(false);
         setExistsDialog({
@@ -106,7 +186,6 @@ export default function App() {
         return;
       }
 
-      // Generation started — poll for progress
       pollRef.current = setInterval(async () => {
         try {
           const status = await getGenerationStatus();
@@ -120,6 +199,8 @@ export default function App() {
             timerRef.current = null;
             setGenerating(false);
             setUrl("");
+            setStartTime("");
+            setEndTime("");
 
             if (status.progress === 100) {
               showToast(`✅ Show "${status.show_id}" generated!`);
@@ -133,14 +214,13 @@ export default function App() {
           clearInterval(timerRef.current);
           setGenerating(false);
         }
-      }, 1000);  // Poll every 1s for snappy updates
+      }, 1000);
     } catch (err) {
       setGenerating(false);
       showToast(`❌ ${err.message}`);
     }
   };
 
-  // Cleanup polling on unmount
   useEffect(() => {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
@@ -153,6 +233,7 @@ export default function App() {
     try {
       await playShow(showId);
       setIsPlaying(true);
+      setPlaybackState("playing");
       showToast("▶ Playing show (synced mode)");
     } catch (err) {
       showToast(`❌ ${err.message}`);
@@ -175,7 +256,36 @@ export default function App() {
     try {
       await stopPlayback();
       setIsPlaying(false);
+      setPlaybackState("stopped");
+      setPlaybackPos(0);
       showToast("⏹ Playback stopped");
+    } catch (err) {
+      showToast(`❌ ${err.message}`);
+    }
+  };
+
+  // ── Handle Pause / Resume ──
+  const handlePauseResume = async () => {
+    try {
+      if (playbackState === "paused") {
+        await resumePlayback();
+        setPlaybackState("playing");
+      } else {
+        await pausePlayback();
+        setPlaybackState("paused");
+      }
+    } catch (err) {
+      showToast(`❌ ${err.message}`);
+    }
+  };
+
+  // ── Handle Seek ──
+  const handleSeek = async (e) => {
+    const newPos = parseFloat(e.target.value);
+    setPlaybackPos(newPos);
+    setIsSeeking(false);
+    try {
+      await seekPlayback(newPos);
     } catch (err) {
       showToast(`❌ ${err.message}`);
     }
@@ -240,6 +350,28 @@ export default function App() {
         </button>
       </div>
 
+      {/* ── Time Range Inputs (optional) ── */}
+      <div className="time-range-bar">
+        <span className="time-range-label">✂️ Trim (optional):</span>
+        <input
+          className="time-input"
+          type="text"
+          placeholder="Start (e.g. 1:30)"
+          value={startTime}
+          onChange={(e) => setStartTime(e.target.value)}
+          disabled={generating}
+        />
+        <span className="time-range-sep">→</span>
+        <input
+          className="time-input"
+          type="text"
+          placeholder="End (e.g. 5:00)"
+          value={endTime}
+          onChange={(e) => setEndTime(e.target.value)}
+          disabled={generating}
+        />
+      </div>
+
       {/* ── Generation Progress ── */}
       {generating && (
         <div className="progress-section">
@@ -259,6 +391,46 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Now Playing / Player Controls ── */}
+      {isPlaying && (
+        <div className="player-panel">
+          <div className="player-header">
+            <span className="player-title">🎵 Now Playing</span>
+            <div className="player-meta">
+              {cueName && <span className="player-cue">{cueName}</span>}
+              {behavior && <span className="player-behavior">{behavior}</span>}
+            </div>
+          </div>
+
+          <div className="player-slider-row">
+            <span className="player-time">{formatDuration(playbackPos)}</span>
+            <input
+              type="range"
+              className="player-slider"
+              min="0"
+              max={playbackDuration || 1}
+              step="0.5"
+              value={isSeeking ? undefined : playbackPos}
+              onMouseDown={() => setIsSeeking(true)}
+              onTouchStart={() => setIsSeeking(true)}
+              onChange={(e) => setPlaybackPos(parseFloat(e.target.value))}
+              onMouseUp={handleSeek}
+              onTouchEnd={handleSeek}
+            />
+            <span className="player-time">{formatDuration(playbackDuration)}</span>
+          </div>
+
+          <div className="player-controls">
+            <button className="btn btn-secondary btn-sm" onClick={handlePauseResume}>
+              {playbackState === "paused" ? "▶ Resume" : "⏸ Pause"}
+            </button>
+            <button className="btn btn-danger btn-sm" onClick={handleStop}>
+              ⏹ Stop
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Global Controls Bar ── */}
       <div className="controls-bar">
         <button
@@ -268,7 +440,7 @@ export default function App() {
         >
           🎧 Live Loopback Mode
         </button>
-        {isPlaying && (
+        {isPlaying && !isPlaying && (
           <button className="btn btn-danger" onClick={handleStop}>
             ⏹ Stop
           </button>
@@ -301,7 +473,6 @@ export default function App() {
                   : undefined,
               }}
             >
-              {/* Card Header */}
               <div className="show-card-header">
                 <div className="show-card-title" title={show.title}>
                   {show.title}
@@ -315,14 +486,12 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Metadata */}
               <div className="show-card-meta">
                 <span>🕐 {formatDuration(show.duration)}</span>
                 <span>🎨 {show.num_cues || show.num_phrases} cues</span>
                 <span>📅 {show.created_at?.split(" ")[0]}</span>
               </div>
 
-              {/* Color Palette Preview */}
               <div className="palette-preview">
                 {show.palette_preview?.map((p, i) => (
                   <div key={i} style={{ display: "flex", gap: 3 }}>
@@ -340,7 +509,6 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Action Buttons */}
               <div className="show-card-actions">
                 <button
                   className="btn btn-success btn-sm"

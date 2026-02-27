@@ -84,19 +84,46 @@ export function getStatus() {
 
 /** 
  * POST /api/shows/generate → Start AI show generation from YouTube URL 
- * 
- * If regenerate=false and the show already exists, API returns { status: "exists" }
- * so the UI can ask the user what to do. If regenerate=true, it skips the download
- * and re-runs only the AI plan generation (saves ~2 minutes).
+ * Supports optional time range trimming via start_time/end_time (seconds).
  */
-export function generateShow(youtubeUrl, regenerate = false) {
+export function generateShow(youtubeUrl, regenerate = false, startTime = null, endTime = null) {
+    const body = { url: youtubeUrl, regenerate };
+    if (startTime !== null) body.start_time = startTime;
+    if (endTime !== null) body.end_time = endTime;
     return apiFetch("/api/shows/generate", {
         method: "POST",
-        body: JSON.stringify({ url: youtubeUrl, regenerate }),
+        body: JSON.stringify(body),
     });
 }
 
 /** GET /api/shows/generate/status → Poll generation progress */
 export function getGenerationStatus() {
     return apiFetch("/api/shows/generate/status");
+}
+
+// ==========================================
+// PLAYBACK CONTROL
+// ==========================================
+
+/** GET /api/playback/position → Get current playback position, duration, state */
+export function getPlaybackPosition() {
+    return apiFetch("/api/playback/position");
+}
+
+/** POST /api/playback/seek → Seek to a position (seconds) */
+export function seekPlayback(position) {
+    return apiFetch("/api/playback/seek", {
+        method: "POST",
+        body: JSON.stringify({ position }),
+    });
+}
+
+/** POST /api/playback/pause → Pause synced playback */
+export function pausePlayback() {
+    return apiFetch("/api/playback/pause", { method: "POST" });
+}
+
+/** POST /api/playback/resume → Resume paused playback */
+export function resumePlayback() {
+    return apiFetch("/api/playback/resume", { method: "POST" });
 }

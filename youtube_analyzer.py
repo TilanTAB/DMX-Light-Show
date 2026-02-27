@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import wave
@@ -6,7 +7,55 @@ import numpy as np
 import llm_designer
 
 YOUTUBE_AUDIO_DIR = "youtube_audio"
+
+# Whitelist of valid YouTube URL patterns
+_YOUTUBE_URL_PATTERN = re.compile(
+    r'^https?://(www\.)?(youtube\.com/(watch|shorts|embed)|youtu\.be/|music\.youtube\.com/)'
+)
 SHOW_FILE = "current_show.json"
+
+
+def trim_audio_range(audio_path, start_sec=None, end_sec=None):
+    """
+    Trim a WAV file to [start_sec, end_sec] using ffmpeg.
+    Returns path to trimmed file, or original path if no trimming needed.
+    """
+    if start_sec is None and end_sec is None:
+        return audio_path
+
+    import subprocess
+
+    base, ext = os.path.splitext(audio_path)
+    trimmed_path = f"{base}_trimmed{ext}"
+
+    cmd = ["ffmpeg", "-y", "-i", audio_path]
+    if start_sec is not None:
+        cmd.extend(["-ss", str(start_sec)])
+    if end_sec is not None:
+        cmd.extend(["-to", str(end_sec)])
+    # Copy codec for instant trim (no re-encoding)
+    cmd.extend(["-c", "copy", trimmed_path])
+
+    print(f"[+] Trimming audio: {_fmt_time(start_sec or 0)} → {_fmt_time(end_sec) if end_sec else 'end'}", flush=True)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            print(f"[-] ffmpeg trim failed: {result.stderr[-300:]}", flush=True)
+            return audio_path  # Fall back to untrimmed
+        print(f"[+] Trimmed audio saved: {os.path.basename(trimmed_path)}", flush=True)
+        return trimmed_path
+    except Exception as e:
+        print(f"[-] Trim error: {e}", flush=True)
+        return audio_path
+
+
+def _fmt_time(seconds):
+    """Format seconds as M:SS for display."""
+    if seconds is None:
+        return "--:--"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
 
 
 def download_youtube_audio(url):
@@ -18,6 +67,11 @@ def download_youtube_audio(url):
     """
     import subprocess
     os.makedirs(YOUTUBE_AUDIO_DIR, exist_ok=True)
+
+    # C4 FIX: Validate URL before passing to subprocess
+    if not _YOUTUBE_URL_PATTERN.match(url):
+        print(f"[-] Invalid YouTube URL: {url}", flush=True)
+        return None
 
     print(f"\n[+] Downloading BEST quality audio from YouTube...", flush=True)
     print(f"    URL: {url}", flush=True)
@@ -335,15 +389,27 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Parse CLI arguments
-    # Usage: python youtube_analyzer.py <URL> [--skip-download] [--audio <path>]
+    # Usage: python youtube_analyzer.py <URL> [--skip-download] [--audio <path>] [--start <sec>] [--end <sec>]
     args = sys.argv[1:]
     user_input = None
     skip_download = "--skip-download" in args
     audio_override = None
+    trim_start = None
+    trim_end = None
     
     for i, arg in enumerate(args):
         if arg == "--audio" and i + 1 < len(args):
             audio_override = args[i + 1]
+        elif arg == "--start" and i + 1 < len(args):
+            try:
+                trim_start = float(args[i + 1])
+            except ValueError:
+                pass
+        elif arg == "--end" and i + 1 < len(args):
+            try:
+                trim_end = float(args[i + 1])
+            except ValueError:
+                pass
         elif not arg.startswith("--"):
             user_input = arg.strip()
     
@@ -378,6 +444,10 @@ if __name__ == "__main__":
             exit(1)
         audio_file = max(files, key=os.path.getctime)
         print(f"\n[+] Using existing file: {os.path.basename(audio_file)}", flush=True)
+    
+    # Step 0.5: Trim to user-specified range if requested
+    if trim_start is not None or trim_end is not None:
+        audio_file = trim_audio_range(audio_file, trim_start, trim_end)
     
     # Step 1: Analyze the audio structure
     telemetry = analyze_audio_structure(audio_file)

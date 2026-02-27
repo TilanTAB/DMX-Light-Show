@@ -1,469 +1,952 @@
+"""
+DMX Light Show Engine V9 — Class-based architecture (I1 FIX)
+All mutable state is encapsulated in DMXEngine.
+Hardware init is deferred to run() methods (also fixes C1).
+"""
 import usb.core
 import time
 import os
 import sys
 import json
+import math
 import numpy as np
 import pyaudiowpatch as pyaudio
 import logging
+from collections import deque
 
-# Define logger
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# DMX & LIGHT CONFIGURATION
-# ==========================================
-# Channel Map: CH1=Master, CH2=Red, CH3=Green, CH4=Blue, CH5=White, CH6=Strobe
-dev = usb.core.find(idVendor=0x16C0, idProduct=0x05DC)
-if dev is None:
-    logger.error("uDMX not found! Please connect the adapter.")
-    exit()
-
-logger.info("uDMX found! Setting up audio stream...")
-
-def send_dmx(master, red, green, blue, white=0, strobe=0):
-    data = [master, red, green, blue, white, strobe, 0, 0]
-    try:
-        dev.ctrl_transfer(0x40, 2, 8, 0, data)
-    except Exception as e:
-        logger.warning(f"Failed to send DMX packet: {e}")
-
-# ==========================================
-# AUDIO PROCESSING CONFIG
+# CONSTANTS (immutable — safe at module level)
 # ==========================================
 SAMPLE_RATE = 44100
-BLOCK_SIZE = 1024          # ~23ms per frame at 44.1kHz
-MIN_VOLUME_GATE = 0.001    # Silence gate
+BLOCK_SIZE = 1024
+MIN_VOLUME_GATE = 0.001
 
-# Frequency band definitions (Hz) — covers the actual instrument ranges
-KICK_LO,  KICK_HI  = 30,  150    # Kick drum body + punch
-SNARE_LO, SNARE_HI = 150, 400    # Snare crack + body
-MID_LO,   MID_HI   = 400, 2000   # Vocals, guitars, synths
-HIHAT_LO, HIHAT_HI = 4000, 10000 # Hi-hats, cymbals, sibilance
+# Frequency bands
+KICK_LO, KICK_HI = 30, 150
+SNARE_LO, SNARE_HI = 150, 400
+MID_LO, MID_HI = 400, 2000
+HIHAT_LO, HIHAT_HI = 4000, 10000
 
-# Sensitivity: how much a transient above the moving average triggers intensity
-KICK_GAIN  = 6.0   # Kick → primary color flash
-SNARE_GAIN = 4.0   # Snare → secondary color flash
-MID_GAIN   = 2.0   # Mids → gentle wash
-HIHAT_GAIN = 3.0   # Hi-hat → white shimmer
+# Gain per band
+KICK_GAIN = 6.0
+SNARE_GAIN = 4.0
+MID_GAIN = 2.0
+HIHAT_GAIN = 3.0
 
-# Beat detection: onset must exceed (moving_avg * threshold) to count
-ONSET_THRESHOLD = 1.5    # How far above background a hit must be
-ONSET_COOLDOWN  = 0.12   # Minimum seconds between registered beats (prevents doubles)
+# Beat detection
+ONSET_COOLDOWN = 0.12
+AGC_SPEED = 0.015
+LOOPBACK_GAIN_BOOST = 5.0   # Loopback audio is much quieter than WAV
+LOOPBACK_VOLUME_GATE = 0.00005  # Near-zero gate — if there's any audio, process it
+LOOPBACK_AGC_THRESH = 0.3   # Lower AGC threshold for loopback (vs 0.7 for synced)
 
-# Smoothing: attack = how fast lights snap ON, decay = how fast they fade OFF
-# 1.0 = instant, 0.0 = frozen.  Drums need instant attack, fast decay.
-ATTACK_BEAT  = 0.95  # When a beat is detected: snap ON
-DECAY_BEAT   = 0.25  # Between beats: fade out quickly (punchy feel)
-ATTACK_WASH  = 0.08  # For mids/vocals: slow, gentle rise
-DECAY_WASH   = 0.03  # Slow fade for ambient wash
-
-# AGC (Auto Gain Control) — tracks background level per band
-AGC_SPEED = 0.015  # Slow adaptation (don't chase individual beats)
-
-# ==========================================
-# CURATED COLOR PALETTES (fallback)
-# ==========================================
-PALETTES = [
-    ((255, 0, 50),   (0, 150, 255)),   # Cyberpunk (Hot Pink & Cyan)
-    ((255, 50, 0),   (100, 0, 255)),   # Synthwave (Neon Orange & Deep Purple)
-    ((0, 255, 100),  (255, 0, 200)),   # Toxic (Lime Green & Magenta)
+# Default palettes: (kick_color, snare_color) — high contrast pairs
+DEFAULT_PALETTES = [
+    ((255, 0, 50), (0, 150, 255)),     # Red vs Blue
+    ((255, 50, 0), (100, 0, 255)),     # Orange vs Purple
+    ((0, 255, 100), (255, 0, 200)),    # Green vs Pink
+    ((255, 200, 0), (0, 50, 255)),     # Gold vs Deep Blue
+    ((0, 255, 255), (255, 0, 80)),     # Cyan vs Red
+    ((200, 0, 255), (0, 255, 50)),     # Violet vs Green
+    ((255, 100, 0), (0, 200, 255)),    # Amber vs Sky Blue
+    ((255, 0, 150), (50, 255, 0)),     # Magenta vs Lime
 ]
 
+VALID_BEHAVIORS = {
+    "blackout_punch", "slow_breathe", "bass_white_blast", "color_chase",
+    "buildup_ramp", "static_wash", "strobe_blast", "fast_pulse",
+    "beat_reactive", "rainbow_sweep", "instant_flash",
+}
+
+
 # ==========================================
-# ENGINE STATE
+# PURE HELPER FUNCTIONS (no state)
 # ==========================================
-# Smoothed output channels
-out_r, out_g, out_b, out_w, out_master = 0.0, 0.0, 0.0, 0.0, 0.0
-
-# AGC rolling averages (per band)
-agc_kick, agc_snare, agc_mid, agc_hihat = 0.0, 0.0, 0.0, 0.0
-
-# Previous frame FFT magnitudes (for spectral flux onset detection)
-prev_kick_mag, prev_snare_mag, prev_hihat_mag = 0.0, 0.0, 0.0
-
-# Beat tracking
-beat_timestamps = []
-total_beat_count = 0
-current_palette_idx = 0
-last_beat_time = 0.0
-
-# Synced mode: AI cue list
-synced_cues = []
-synced_start_time = 0.0
+def get_band_mag(fft_data, fft_freqs, lo, hi):
+    idx = np.where((fft_freqs >= lo) & (fft_freqs <= hi))[0]
+    return float(np.mean(fft_data[idx])) if len(idx) > 0 else 0.0
 
 
-def load_ai_show(show_file="current_show.json"):
-    """Load AI-generated palettes and cue list from a show JSON file."""
-    global PALETTES, current_palette_idx, synced_cues
-
-    if not os.path.exists(show_file):
-        logger.warning(f"No {show_file} found! Using default fallback palettes.")
-        return None
-
-    try:
-        with open(show_file, 'r') as f:
-            data = json.load(f)
-
-        plan = data.get("lighting_plan", {})
-
-        # Load color palettes from phrases
-        phrases = plan.get("phrases", [])
-        if phrases:
-            new_palettes = []
-            for p in phrases:
-                c1 = tuple(p.get("color_1", [255, 255, 255]))
-                c2 = tuple(p.get("color_2", [255, 255, 255]))
-                new_palettes.append((c1, c2))
-            PALETTES = new_palettes
-            current_palette_idx = 0
-            logger.info(f"Loaded {len(PALETTES)} AI palettes from {show_file}")
-
-        # Load timestamped cues for synced mode
-        cues = plan.get("cues", [])
-        if cues:
-            synced_cues.clear()
-            for c in cues:
-                synced_cues.append({
-                    "start": c.get("start_time", 0),
-                    "end": c.get("end_time", 0),
-                    "color_1": tuple(c.get("color_1", [255, 255, 255])),
-                    "color_2": tuple(c.get("color_2", [255, 255, 255])),
-                    "energy": c.get("energy_level", 3),
-                    "strobe": c.get("strobe_allowed", False),
-                    "behavior": c.get("behavior", "static_wash"),
-                    "name": c.get("section_name", ""),
-                })
-            synced_cues.sort(key=lambda x: x["start"])
-            logger.info(f"Loaded {len(synced_cues)} timestamped cues for synced mode")
-
-        return data.get("audio_file")
-    except Exception as e:
-        logger.error(f"Failed to load AI show: {e}")
-        return None
+def ema(current, target, attack, decay):
+    speed = attack if target > current else decay
+    return current + speed * (target - current)
 
 
-def get_active_cue(elapsed_seconds):
-    """Find the AI cue that should be active at the given timestamp."""
-    for cue in reversed(synced_cues):
-        if elapsed_seconds >= cue["start"]:
-            return cue
-    return None
+def lerp_color(c1, c2, t):
+    """Linear interpolate between two RGB tuples. t=0→c1, t=1→c2."""
+    t = max(0.0, min(1.0, t))
+    return (
+        c1[0] + (c2[0] - c1[0]) * t,
+        c1[1] + (c2[1] - c1[1]) * t,
+        c1[2] + (c2[2] - c1[2]) * t,
+    )
 
 
-def get_band_magnitude(fft_data, fft_freqs, lo_hz, hi_hz):
-    """Extract average magnitude for a frequency range from FFT data."""
-    idx = np.where((fft_freqs >= lo_hz) & (fft_freqs <= hi_hz))[0]
-    if len(idx) == 0:
-        return 0.0
-    return float(np.mean(fft_data[idx]))
-
-
-def process_audio(indata, input_format="int16", elapsed_seconds=None):
+# ============================================================
+# DMX ENGINE — All mutable state lives here (I1 FIX)
+# ============================================================
+class DMXEngine:
     """
-    Core audio-reactive engine. Processes one audio frame and sends DMX.
-    
-    Uses SPECTRAL FLUX onset detection for drum hits:
-    - Compares current FFT magnitude to previous frame
-    - A sudden increase = onset (drum hit, transient)
-    - This is far more responsive than simple threshold detection
-    
-    Separate frequency bands for kick, snare, hi-hat, and mids
-    allow each instrument to drive a different light behavior.
+    Encapsulates all DMX light engine state. Create one instance,
+    call run_synced_mode() or run_loopback_mode().
+    Hardware discovery is deferred to first use (fixes C1).
     """
-    global out_r, out_g, out_b, out_w, out_master
-    global agc_kick, agc_snare, agc_mid, agc_hihat
-    global prev_kick_mag, prev_snare_mag, prev_hihat_mag
-    global beat_timestamps, total_beat_count, current_palette_idx, last_beat_time
 
-    # --- Decode audio bytes to float array ---
-    if isinstance(indata, bytes):
-        if input_format == "float32":
-            audio_data = np.frombuffer(indata, dtype=np.float32)
-        else:
-            audio_data = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
-    else:
-        audio_data = indata
+    def __init__(self):
+        # DMX device (lazy init)
+        self.dev = None
 
-    # Stereo → Mono
-    if len(audio_data) > 0 and len(audio_data) % 2 == 0:
-        mono = (audio_data[0::2] + audio_data[1::2]) / 2.0
-    else:
-        mono = audio_data
+        # Output channels
+        self.out_r = 0.0
+        self.out_g = 0.0
+        self.out_b = 0.0
+        self.out_w = 0.0
+        self.out_master = 0.0
+        self.out_strobe = 0.0
 
-    # Volume RMS
-    volume = float(np.sqrt(np.mean(mono ** 2))) if len(mono) > 0 else 0.0
+        # AGC state
+        self.agc_kick = 0.0
+        self.agc_snare = 0.0
+        self.agc_mid = 0.0
+        self.agc_hihat = 0.0
 
-    if volume < MIN_VOLUME_GATE:
-        # Silence — fade to black
-        out_r *= 0.9
-        out_g *= 0.9
-        out_b *= 0.9
-        out_w *= 0.9
-        out_master *= 0.9
-        send_dmx(int(out_master), int(out_r), int(out_g), int(out_b), int(out_w), 0)
-        return
+        # Previous magnitudes for spectral flux
+        self.prev_kick_mag = 0.0
+        self.prev_snare_mag = 0.0
+        self.prev_hihat_mag = 0.0
 
-    # --- FFT ---
-    N = len(mono)
-    if N == 0:
-        return
+        # Beat tracking
+        self.beat_timestamps = []
+        self.total_beat_count = 0
+        self.last_beat_time = 0.0
+        self.frame_counter = 0
 
-    yf = np.fft.rfft(mono)           # Real FFT (more efficient)
-    fft_data = np.abs(yf) / N        # Normalize
-    fft_freqs = np.fft.rfftfreq(N, 1.0 / SAMPLE_RATE)
+        # Palette and cue state
+        self.palettes = list(DEFAULT_PALETTES)
+        self.current_palette_idx = 0
+        self.synced_cues = []
 
-    # Extract per-band magnitudes
-    kick_mag  = get_band_magnitude(fft_data, fft_freqs, KICK_LO, KICK_HI)
-    snare_mag = get_band_magnitude(fft_data, fft_freqs, SNARE_LO, SNARE_HI)
-    mid_mag   = get_band_magnitude(fft_data, fft_freqs, MID_LO, MID_HI)
-    hihat_mag = get_band_magnitude(fft_data, fft_freqs, HIHAT_LO, HIHAT_HI)
+        # Auto-behavior detection (non-AI / loopback)
+        self.volume_history = deque(maxlen=200)
+        self.energy_state = "calm"
+        self.energy_state_since = 0.0
+        self.drop_cooldown = 0.0
 
-    # --- AGC: track background level per band ---
-    agc_kick  += AGC_SPEED * (kick_mag  - agc_kick)
-    agc_snare += AGC_SPEED * (snare_mag - agc_snare)
-    agc_mid   += AGC_SPEED * (mid_mag   - agc_mid)
-    agc_hihat += AGC_SPEED * (hihat_mag - agc_hihat)
+        # Loopback direct-drive state
+        self.peak_kick = 0.0
+        self.peak_snare = 0.0
+        self.peak_mid = 0.0
+        self.peak_hihat = 0.0
+        self.last_palette_rotate = 0.0
+        self.beat_hold_frames = 0  # Hold full brightness for N frames after beat
+        self.beat_hold_color = (255, 0, 50)  # Which color to hold
 
-    # --- SPECTRAL FLUX ONSET DETECTION ---
-    # A "hit" = current magnitude significantly exceeds BOTH the AGC baseline
-    # AND the previous frame (spectral flux = frame-to-frame increase)
-    kick_flux  = max(0.0, kick_mag  - prev_kick_mag)   # Only positive flux (onsets)
-    snare_flux = max(0.0, snare_mag - prev_snare_mag)
-    hihat_flux = max(0.0, hihat_mag - prev_hihat_mag)
+        # Playback control state (IPC via files)
+        self.playback_position = 0.0
+        self.playback_duration = 0.0
+        self.playback_state = "stopped"  # stopped, playing, paused
+        self.current_cue_name = ""
+        self.current_behavior = "beat_reactive"
+        self.is_paused = False
+        self._state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playback_state.json")
+        self._command_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playback_command.json")
 
-    # Also check AGC-normalized hit (above background)
-    kick_hit  = max(0.0, kick_mag  - agc_kick  * 0.8)
-    snare_hit = max(0.0, snare_mag - agc_snare * 0.8)
-    mid_hit   = max(0.0, mid_mag   - agc_mid   * 0.5)
-    hihat_hit = max(0.0, hihat_mag - agc_hihat * 0.5)
+        # Behavior dispatch table
+        self._behavior_map = {
+            "blackout_punch": self._render_blackout_punch,
+            "slow_breathe": self._render_slow_breathe,
+            "bass_white_blast": self._render_bass_white_blast,
+            "color_chase": self._render_color_chase,
+            "buildup_ramp": self._render_buildup_ramp,
+            "static_wash": self._render_static_wash,
+            "strobe_blast": self._render_strobe_blast,
+            "fast_pulse": self._render_fast_pulse,
+            "beat_reactive": self._render_beat_reactive,
+            "rainbow_sweep": self._render_rainbow_sweep,
+            "instant_flash": self._render_blackout_punch,
+        }
 
-    # Combined onset score = flux + AGC hit (both must contribute)
-    kick_onset  = (kick_flux  * 0.6 + kick_hit  * 0.4) * KICK_GAIN
-    snare_onset = (snare_flux * 0.6 + snare_hit * 0.4) * SNARE_GAIN
-    hihat_onset = (hihat_flux * 0.5 + hihat_hit * 0.5) * HIHAT_GAIN
-    mid_level   = mid_hit * MID_GAIN
+    # ----------------------------------------------------------
+    # HARDWARE
+    # ----------------------------------------------------------
+    def _init_hardware(self):
+        """Find uDMX adapter. Raises RuntimeError if not found."""
+        self.dev = usb.core.find(idVendor=0x16C0, idProduct=0x05DC)
+        if self.dev is None:
+            raise RuntimeError("uDMX not found! Please connect the adapter.")
+        logger.info("uDMX found!")
 
-    # Store for next frame
-    prev_kick_mag  = kick_mag
-    prev_snare_mag = snare_mag
-    prev_hihat_mag = hihat_mag
-
-    # Normalize to 0-1
-    kick_i  = min(1.0, kick_onset)
-    snare_i = min(1.0, snare_onset)
-    hihat_i = min(1.0, hihat_onset)
-    mid_i   = min(1.0, mid_level)
-
-    # --- BEAT REGISTRATION ---
-    current_time = time.time()
-    is_kick_beat = kick_i > 0.3 and (current_time - last_beat_time) > ONSET_COOLDOWN
-    is_snare_beat = snare_i > 0.35 and (current_time - last_beat_time) > ONSET_COOLDOWN
-
-    if is_kick_beat or is_snare_beat:
-        last_beat_time = current_time
-        beat_timestamps.append(current_time)
-        total_beat_count += 1
-
-        # Palette rotation every 32 beats (roughly every 8 bars at 120bpm)
-        if total_beat_count % 32 == 0:
-            current_palette_idx = (current_palette_idx + 1) % len(PALETTES)
-            logger.info(f"Palette change → {current_palette_idx}")
-
-    # Clean old timestamps (keep last 3 seconds)
-    beat_timestamps = [t for t in beat_timestamps if current_time - t < 3.0]
-
-    # --- DETERMINE COLORS & ENERGY from AI cue ---
-    cue_energy = 5  # Default mid-energy
-    cue_strobe_ok = False
-    if elapsed_seconds is not None and synced_cues:
-        cue = get_active_cue(elapsed_seconds)
-        if cue:
-            kick_color = cue["color_1"]
-            accent_color = cue["color_2"]
-            cue_energy = cue.get("energy", 5)
-            cue_strobe_ok = cue.get("strobe", False)
-        else:
-            kick_color, accent_color = PALETTES[current_palette_idx]
-    else:
-        kick_color, accent_color = PALETTES[current_palette_idx]
-
-    # Scale detection sensitivity by AI cue energy (1-10)
-    # High-energy sections (chorus/drop) → more reactive to drums
-    energy_boost = 0.5 + (cue_energy / 10.0) * 1.0  # Range: 0.6x to 1.5x
-
-    # --- GUARANTEED MINIMUM FLASH ON BEATS ---
-    # This is the key fix: even a "soft" kick should produce a visible light pulse.
-    # Without this, moderate hits get multiplied by 0.15 intensity = invisible.
-    KICK_MIN_FLASH  = 0.6   # Kick beat → at least 60% brightness
-    SNARE_MIN_FLASH = 0.5   # Snare beat → at least 50% brightness
-
-    # Boost intensities on registered beats
-    if is_kick_beat:
-        kick_i = max(kick_i * energy_boost, KICK_MIN_FLASH)
-    if is_snare_beat:
-        snare_i = max(snare_i * energy_boost, SNARE_MIN_FLASH)
-
-    # --- MIX COLORS ---
-    # Kick drives primary color, snare drives accent, mids add gentle wash
-    target_r = min(255.0, kick_color[0] * kick_i + accent_color[0] * snare_i + accent_color[0] * mid_i * 0.2)
-    target_g = min(255.0, kick_color[1] * kick_i + accent_color[1] * snare_i + accent_color[1] * mid_i * 0.2)
-    target_b = min(255.0, kick_color[2] * kick_i + accent_color[2] * snare_i + accent_color[2] * mid_i * 0.2)
-    target_w = min(255.0, hihat_i * 150)   # Hi-hats → white shimmer
-    target_master = min(255.0, max(40.0, volume * 5000))
-
-    # --- BEAT FLASH: slam master dimmer to full on drum hits ---
-    if is_kick_beat or is_snare_beat:
-        target_master = 255.0  # Full brightness on every drum hit
-
-    # --- SMOOTHING ---
-    is_any_beat = is_kick_beat or is_snare_beat
-
-    # Drums get INSTANT attack (0.95), non-beat frames get gentle wash
-    att_rgb = ATTACK_BEAT if is_any_beat else ATTACK_WASH
-    # Fast decay between beats for punchy feel; slower in low-energy sections
-    dec_rgb = DECAY_BEAT if (kick_i > 0.1 or snare_i > 0.1) else DECAY_WASH
-
-    def ema(current, target, attack, decay):
-        speed = attack if target > current else decay
-        return current + speed * (target - current)
-
-    out_r = ema(out_r, target_r, att_rgb, dec_rgb)
-    out_g = ema(out_g, target_g, att_rgb, dec_rgb)
-    out_b = ema(out_b, target_b, att_rgb, dec_rgb)
-    out_w = ema(out_w, target_w, 0.7, 0.4)
-    out_master = ema(out_master, target_master, 0.8 if is_any_beat else 0.3, 0.15)
-
-    # --- STROBE ---
-    strobe = 0
-    if cue_strobe_ok or (elapsed_seconds is None):
-        # Only strobe when AI cue allows it, or in loopback mode (always allowed)
-        if kick_i > 0.7 and snare_i > 0.4:
-            strobe = 220
-        elif is_kick_beat and kick_i > 0.6:
-            strobe = 100  # Light strobe on strong kicks
-
-    send_dmx(int(out_master), int(out_r), int(out_g), int(out_b), int(out_w), strobe)
-
-
-# ==========================================
-# MODE: SYNCED WAV PLAYBACK
-# ==========================================
-def run_synced_mode(show_file="current_show.json"):
-    """Play a saved WAV file with beat-reactive DMX using AI cue timestamps."""
-    import wave as wave_mod
-
-    audio_path = load_ai_show(show_file)
-    if not audio_path or not os.path.exists(audio_path):
-        logger.error(f"No valid audio file in {show_file}! Run youtube_analyzer.py first.")
-        return
-
-    logger.info(f"[SYNCED] Playing: {os.path.basename(audio_path)}")
-    if synced_cues:
-        logger.info(f"[SYNCED] Using {len(synced_cues)} AI cues for color changes")
-
-    wf = wave_mod.open(audio_path, 'rb')
-    p = pyaudio.PyAudio()
-    stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
-                    channels=wf.getnchannels(),
-                    rate=wf.getframerate(),
-                    output=True)
-
-    logger.info("Starting Audio & DMX Sync... Press Ctrl+C to stop.")
-    chunk_size = 1024
-    data = wf.readframes(chunk_size)
-
-    frames_played = 0
-    sample_rate = wf.getframerate()
-    channels = wf.getnchannels()
-    last_cue_name = ""
-
-    while data:
-        stream.write(data)
-
-        # Calculate exact elapsed time from audio frames (not wall clock — avoids drift)
-        elapsed = frames_played / sample_rate
-        process_audio(data, input_format="int16", elapsed_seconds=elapsed)
-
-        # Log cue transitions
-        if synced_cues:
-            cue = get_active_cue(elapsed)
-            if cue and cue["name"] != last_cue_name:
-                last_cue_name = cue["name"]
-                logger.info(f"[CUE @ {elapsed:.1f}s] {cue['name']} → {cue['color_1']}")
-
-        frames_played += chunk_size
-        data = wf.readframes(chunk_size)
-
-    logger.info("Song complete!")
-    send_dmx(0, 0, 0, 0, 0, 0)
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-
-
-# ==========================================
-# MODE: LIVE LOOPBACK CAPTURE (WASAPI)
-# ==========================================
-def run_loopback_mode(show_file=None):
-    """Capture system audio via WASAPI loopback and react to it in real-time."""
-    if show_file:
-        load_ai_show(show_file)
-
-    p = pyaudio.PyAudio()
-
-    try:
-        logger.debug("Looking for default WASAPI Loopback device...")
-        wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-        default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-
-        if not default_speakers["isLoopbackDevice"]:
-            logger.debug(f"Default speaker: {default_speakers['name']}. Searching loopback pin...")
-            for loopback in p.get_loopback_device_info_generator():
-                if default_speakers["name"] in loopback["name"]:
-                    default_speakers = loopback
-                    break
-
-        logger.info(f"[LOOPBACK] Captured: {default_speakers['name']}")
-
-    except OSError as e:
-        logger.error(f"Couldn't find WASAPI device: {e}")
-        return
-
-    logger.info("Capturing system audio... Play some music!")
-    logger.info("Press Ctrl+C to stop.\n")
-
-    def py_audio_callback(in_data, frame_count, time_info, status):
-        if status:
-            logger.warning(f"Stream status: {status}")
+    def send_dmx(self, master, red, green, blue, white=0, strobe=0):
+        data = [int(max(0, min(255, v))) for v in [master, red, green, blue, white, strobe, 0, 0]]
         try:
-            process_audio(in_data, input_format="float32")
-        except Exception as ex:
-            logger.error(f"Audio chunk error: {ex}")
-        return (in_data, pyaudio.paContinue)
+            self.dev.ctrl_transfer(0x40, 2, 8, 0, data)
+        except Exception as e:
+            logger.warning(f"Failed to send DMX packet: {e}")
 
-    stream = p.open(format=pyaudio.paFloat32,
-                    channels=default_speakers["maxInputChannels"],
-                    rate=int(default_speakers["defaultSampleRate"]),
-                    frames_per_buffer=BLOCK_SIZE,
-                    input=True,
-                    input_device_index=default_speakers["index"],
-                    stream_callback=py_audio_callback)
+    # ----------------------------------------------------------
+    # IPC: Position reporting + command handling
+    # ----------------------------------------------------------
+    def _write_playback_state(self):
+        """Atomically write current playback state for the API to read."""
+        state = {
+            "position": round(self.playback_position, 2),
+            "duration": round(self.playback_duration, 2),
+            "state": "paused" if self.is_paused else self.playback_state,
+            "cue_name": self.current_cue_name,
+            "behavior": self.current_behavior,
+        }
+        tmp = self._state_file + ".tmp"
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(state, f)
+            os.replace(tmp, self._state_file)  # Atomic on Windows
+        except Exception:
+            pass  # Non-critical — don't crash the audio loop
 
-    with stream:
-        logger.debug("Loopback stream active.")
-        while stream.is_active():
-            time.sleep(0.1)
+    def _check_playback_command(self):
+        """Check for a command file from the API. Returns command dict or None.
+        FIX #2: Atomically rename before reading to prevent lost commands."""
+        if not os.path.exists(self._command_file):
+            return None
+        consumed = self._command_file + ".consumed"
+        try:
+            os.replace(self._command_file, consumed)  # Atomic move
+        except (FileNotFoundError, OSError):
+            return None  # File vanished between exists() and replace()
+        try:
+            with open(consumed, 'r') as f:
+                cmd = json.load(f)
+            os.remove(consumed)
+            logger.info(f"[IPC] Command received: {cmd}")
+            return cmd
+        except Exception:
+            try:
+                os.remove(consumed)
+            except OSError:
+                pass
+            return None
+
+    def _cleanup_ipc_files(self):
+        """Remove IPC files on shutdown."""
+        for path in (self._state_file, self._command_file, self._state_file + ".tmp"):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+    # ----------------------------------------------------------
+    # SHOW LOADING
+    # ----------------------------------------------------------
+    def load_ai_show(self, show_file="current_show.json"):
+        """Load AI-generated palettes and cue list from a show JSON file."""
+        if not os.path.exists(show_file):
+            logger.warning(f"No {show_file} found! Using default fallback palettes.")
+            return None
+
+        try:
+            with open(show_file, 'r') as f:
+                data = json.load(f)
+
+            plan = data.get("lighting_plan", {})
+
+            phrases = plan.get("phrases", [])
+            if phrases:
+                new_palettes = []
+                for p in phrases:
+                    c1 = tuple(p.get("color_1", [255, 255, 255]))
+                    c2 = tuple(p.get("color_2", [255, 255, 255]))
+                    new_palettes.append((c1, c2))
+                self.palettes = new_palettes
+                self.current_palette_idx = 0
+                logger.info(f"Loaded {len(self.palettes)} AI palettes")
+
+            cues = plan.get("cues", [])
+            if cues:
+                self.synced_cues.clear()
+                for c in cues:
+                    self.synced_cues.append({
+                        "start": c.get("start_time", 0),
+                        "end": c.get("end_time", 0),
+                        "color_1": tuple(c.get("color_1", [255, 255, 255])),
+                        "color_2": tuple(c.get("color_2", [255, 255, 255])),
+                        "energy": c.get("energy_level", 5),
+                        "strobe": c.get("strobe_allowed", False),
+                        "behavior": c.get("behavior", "beat_reactive"),
+                        "dimmer": c.get("master_dimmer_percent", 80),
+                        "fade": c.get("fade_speed_seconds", 1.0),
+                        "name": c.get("section_name", ""),
+                    })
+                self.synced_cues.sort(key=lambda x: x["start"])
+                logger.info(f"Loaded {len(self.synced_cues)} timestamped cues")
+
+            return data.get("audio_file")
+        except Exception as e:
+            logger.error(f"Failed to load AI show: {e}")
+            return None
+
+    def _get_active_cue(self, elapsed):
+        for cue in reversed(self.synced_cues):
+            if elapsed >= cue["start"]:
+                return cue
+        return None
+
+    # ============================================================
+    # BEHAVIOR RENDERERS
+    # ============================================================
+
+    def _render_blackout_punch(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                               kick_color, accent_color, volume, cue, t):
+        """BLACKOUT between beats → instant WHITE+COLOR blast on kick/snare."""
+        if is_kick or is_snare:
+            self.out_r, self.out_g, self.out_b = kick_color if is_kick else accent_color
+            self.out_w = 255.0
+            self.out_master = 255.0
+            self.out_strobe = 200.0 if cue.get("strobe", False) else 0.0
+        else:
+            self.out_r = ema(self.out_r, 0, 0, 0.4)
+            self.out_g = ema(self.out_g, 0, 0, 0.4)
+            self.out_b = ema(self.out_b, 0, 0, 0.4)
+            self.out_w = ema(self.out_w, 0, 0, 0.5)
+            self.out_master = ema(self.out_master, 0, 0, 0.3)
+            self.out_strobe = 0
+
+    def _render_slow_breathe(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                             kick_color, accent_color, volume, cue, t):
+        """Slow sinusoidal breathing between two colors."""
+        fade_speed = cue.get("fade", 3.0)
+        phase = (math.sin(t * math.pi / fade_speed) + 1.0) / 2.0
+        color = lerp_color(kick_color, accent_color, phase)
+
+        dimmer = cue.get("dimmer", 40) / 100.0
+        brightness = dimmer * (0.6 + 0.4 * phase)
+
+        self.out_r = ema(self.out_r, color[0] * brightness, 0.05, 0.05)
+        self.out_g = ema(self.out_g, color[1] * brightness, 0.05, 0.05)
+        self.out_b = ema(self.out_b, color[2] * brightness, 0.05, 0.05)
+        self.out_w = ema(self.out_w, 30.0 * brightness, 0.03, 0.03)
+        self.out_master = ema(self.out_master, 255.0 * brightness, 0.05, 0.05)
+        self.out_strobe = 0
+
+    def _render_bass_white_blast(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                                 kick_color, accent_color, volume, cue, t):
+        """WHITE LED blasts on every kick. Colored wash underneath from mids."""
+        if is_kick:
+            self.out_w = 255.0
+            self.out_master = 255.0
+        else:
+            self.out_w = ema(self.out_w, 0, 0, 0.35)
+
+        wash_brightness = max(mid_i * 0.4, 0.1)
+        snare_boost = 0.6 if is_snare else 0.0
+
+        self.out_r = ema(self.out_r, kick_color[0] * wash_brightness + accent_color[0] * snare_boost, 0.3, 0.08)
+        self.out_g = ema(self.out_g, kick_color[1] * wash_brightness + accent_color[1] * snare_boost, 0.3, 0.08)
+        self.out_b = ema(self.out_b, kick_color[2] * wash_brightness + accent_color[2] * snare_boost, 0.3, 0.08)
+        self.out_master = ema(self.out_master, max(120.0, volume * 4000), 0.5, 0.15)
+        self.out_strobe = 0
+
+    def _render_color_chase(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                            kick_color, accent_color, volume, cue, t):
+        """Alternates between kick_color and accent_color on EVERY beat."""
+        if is_kick or is_snare:
+            use_primary = (self.total_beat_count % 2 == 0)
+            color = kick_color if use_primary else accent_color
+            self.out_r, self.out_g, self.out_b = color
+            self.out_w = 80.0 if is_kick else 0.0
+            self.out_master = 255.0
+        else:
+            self.out_r = ema(self.out_r, 0, 0, 0.3)
+            self.out_g = ema(self.out_g, 0, 0, 0.3)
+            self.out_b = ema(self.out_b, 0, 0, 0.3)
+            self.out_w = ema(self.out_w, 0, 0, 0.4)
+            self.out_master = ema(self.out_master, 40, 0, 0.15)
+        self.out_strobe = 0
+
+    def _render_buildup_ramp(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                             kick_color, accent_color, volume, cue, t):
+        """Progressive intensity ramp for buildup sections."""
+        section_start = cue.get("start", 0)
+        section_end = cue.get("end", section_start + 8)
+        duration = max(1.0, section_end - section_start)
+        progress = min(1.0, max(0.0, (t - section_start) / duration))
+
+        brightness = 0.2 + progress * 0.8
+        strobe_val = progress * 200 if progress > 0.5 else 0
+
+        color = lerp_color(kick_color, accent_color, progress)
+
+        self.out_r = ema(self.out_r, color[0] * brightness, 0.15, 0.1)
+        self.out_g = ema(self.out_g, color[1] * brightness, 0.15, 0.1)
+        self.out_b = ema(self.out_b, color[2] * brightness, 0.15, 0.1)
+        self.out_w = ema(self.out_w, 255.0 * progress * kick_i if is_kick else self.out_w * 0.9, 0.8, 0.3)
+        self.out_master = ema(self.out_master, 255.0 * brightness, 0.1, 0.05)
+        self.out_strobe = strobe_val
+
+    def _render_static_wash(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                            kick_color, accent_color, volume, cue, t):
+        """Hold a single color wash with subtle volume-linked breathing."""
+        dimmer = cue.get("dimmer", 50) / 100.0
+        breath = 0.7 + 0.3 * min(1.0, volume * 2000)
+
+        self.out_r = ema(self.out_r, kick_color[0] * dimmer * breath, 0.03, 0.03)
+        self.out_g = ema(self.out_g, kick_color[1] * dimmer * breath, 0.03, 0.03)
+        self.out_b = ema(self.out_b, kick_color[2] * dimmer * breath, 0.03, 0.03)
+        if is_snare:
+            self.out_w = 120.0
+        else:
+            self.out_w = ema(self.out_w, 0, 0, 0.15)
+        self.out_master = ema(self.out_master, 255.0 * dimmer * breath, 0.05, 0.05)
+        self.out_strobe = 0
+
+    def _render_strobe_blast(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                             kick_color, accent_color, volume, cue, t):
+        """Rapid full-white strobe. Maximum sensory impact."""
+        self.out_r, self.out_g, self.out_b = accent_color
+        self.out_w = 255.0
+        self.out_master = 255.0
+        self.out_strobe = 240.0
+
+    def _render_fast_pulse(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                           kick_color, accent_color, volume, cue, t):
+        """Rapid beat-synced pulses with hi-hat shimmer."""
+        if is_kick:
+            self.out_r, self.out_g, self.out_b = kick_color
+            self.out_w = 200.0
+            self.out_master = 255.0
+        elif is_snare:
+            self.out_r, self.out_g, self.out_b = accent_color
+            self.out_w = 100.0
+            self.out_master = 255.0
+        else:
+            self.out_r = ema(self.out_r, 0, 0, 0.5)
+            self.out_g = ema(self.out_g, 0, 0, 0.5)
+            self.out_b = ema(self.out_b, 0, 0, 0.5)
+            self.out_w = ema(self.out_w, hihat_i * 100, 0.6, 0.4)
+            self.out_master = ema(self.out_master, 30, 0, 0.25)
+        self.out_strobe = 0
+
+    def _render_beat_reactive(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                              kick_color, accent_color, volume, cue, t):
+        """Default beat-reactive mode: kick→color_1, snare→color_2, bass→white.
+        In loopback mode, maintains an ambient floor so lights are always alive."""
+        energy = cue.get("energy", 5) if cue else 5
+        energy_boost = 0.5 + (energy / 10.0)
+        is_loopback = (self.playback_state == "stopped")  # Loopback never sets playback_state
+
+        # Ambient floor: lights should ALWAYS be somewhat on when music is playing
+        if is_loopback:
+            ambient = min(1.0, volume * 8000)  # Volume drives base brightness
+            ambient_floor = max(0.15, ambient * 0.4)  # Min 15% brightness
+        else:
+            ambient_floor = 0.0
+
+        k = max(kick_i * energy_boost, 0.6) if is_kick else kick_i
+        s = max(snare_i * energy_boost, 0.5) if is_snare else snare_i
+
+        tr = min(255.0, kick_color[0] * k + accent_color[0] * s + accent_color[0] * mid_i * 0.15)
+        tg = min(255.0, kick_color[1] * k + accent_color[1] * s + accent_color[1] * mid_i * 0.15)
+        tb = min(255.0, kick_color[2] * k + accent_color[2] * s + accent_color[2] * mid_i * 0.15)
+
+        # Apply ambient floor — lights always glow when music plays
+        if ambient_floor > 0:
+            tr = max(tr, kick_color[0] * ambient_floor)
+            tg = max(tg, kick_color[1] * ambient_floor)
+            tb = max(tb, kick_color[2] * ambient_floor)
+
+        tw = 255.0 if is_kick else (120.0 if is_snare else max(hihat_i * 100, ambient_floor * 50))
+        tm = 255.0 if (is_kick or is_snare) else max(80.0, volume * 8000, ambient_floor * 255)
+
+        is_beat = is_kick or is_snare
+        att = 0.95 if is_beat else 0.15
+        dec = 0.25 if (kick_i > 0.1 or snare_i > 0.1) else 0.06
+
+        self.out_r = ema(self.out_r, tr, att, dec)
+        self.out_g = ema(self.out_g, tg, att, dec)
+        self.out_b = ema(self.out_b, tb, att, dec)
+        self.out_w = ema(self.out_w, tw, 0.9 if is_kick else 0.3, 0.25)
+        self.out_master = ema(self.out_master, tm, 0.8 if is_beat else 0.4, 0.12)
+
+        strobe = 0
+        if cue and cue.get("strobe", False):
+            if kick_i > 0.7 and snare_i > 0.4:
+                strobe = 220
+        self.out_strobe = strobe
+
+    def _render_rainbow_sweep(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                              kick_color, accent_color, volume, cue, t):
+        """Slowly cycle through hue spectrum. Beats cause brightness pulse."""
+        hue = (t * 0.125) % 1.0
+        h_i = int(hue * 6)
+        f = hue * 6 - h_i
+        q = 1.0 - f
+        colors = [
+            (255, int(f * 255), 0), (int(q * 255), 255, 0), (0, 255, int(f * 255)),
+            (0, int(q * 255), 255), (int(f * 255), 0, 255), (255, 0, int(q * 255)),
+        ]
+        rgb = colors[h_i % 6]
+
+        brightness = 0.5 + 0.5 * min(1.0, volume * 3000)
+        if is_kick:
+            brightness = 1.0
+            self.out_w = 150.0
+        else:
+            self.out_w = ema(self.out_w, 0, 0, 0.3)
+
+        self.out_r = ema(self.out_r, rgb[0] * brightness, 0.2, 0.08)
+        self.out_g = ema(self.out_g, rgb[1] * brightness, 0.2, 0.08)
+        self.out_b = ema(self.out_b, rgb[2] * brightness, 0.2, 0.08)
+        self.out_master = ema(self.out_master, 255 * brightness, 0.3, 0.1)
+        self.out_strobe = 0
+
+    # ============================================================
+    # LOOPBACK DIRECT-DRIVE RENDERER
+    # Maps frequency energy directly to light output — no beat
+    # onset detection needed. Every frame produces visible light.
+    # ============================================================
+    def _render_loopback_direct(self, kick_mag, snare_mag, mid_mag, hihat_mag,
+                                kick_i, snare_i, hihat_i, mid_i,
+                                is_kick, is_snare,
+                                color_1, color_2, volume, t):
+        """
+        Concert-style loopback renderer.
+        Philosophy: DARKNESS is the design. Beats PUNCH through the dark.
+        One color per hit. Aggressive decay between beats.
+        """
+        # Peak tracking for auto-gain normalization
+        self.peak_kick = max(kick_mag, self.peak_kick * 0.97)
+        self.peak_snare = max(snare_mag, self.peak_snare * 0.97)
+        self.peak_mid = max(mid_mag, self.peak_mid * 0.97)
+
+        def norm(val, peak):
+            if peak < 0.00001:
+                return 0.0
+            return min(1.0, val / (peak * 0.5))
+
+        bass = norm(kick_mag, self.peak_kick)
+        mids = norm(mid_mag, self.peak_mid)
+
+        # ── STRONG BEAT: Full blast with color ──
+        if is_kick:
+            self.out_r = color_1[0]
+            self.out_g = color_1[1]
+            self.out_b = color_1[2]
+            self.out_w = 220.0
+            self.out_master = 255.0
+            self.out_strobe = 0
+            self.beat_hold_frames = 4
+            self.beat_hold_color = color_1
+            return
+
+        if is_snare:
+            self.out_r = color_2[0]
+            self.out_g = color_2[1]
+            self.out_b = color_2[2]
+            self.out_w = 150.0
+            self.out_master = 255.0
+            self.out_strobe = 0
+            self.beat_hold_frames = 3
+            self.beat_hold_color = color_2
+            return
+
+        # ── HOLD after beat ──
+        if self.beat_hold_frames > 0:
+            self.beat_hold_frames -= 1
+            c = self.beat_hold_color
+            self.out_r = c[0]
+            self.out_g = c[1]
+            self.out_b = c[2]
+            self.out_w = max(self.out_w * 0.85, 30)
+            self.out_master = 255.0
+            self.out_strobe = 0
+            return
+
+        # ── NO BEAT: Energy-driven dim glow ──
+        # Bass drives brightness between 10% and 50%
+        glow = 0.10 + bass * 0.40  # Range: 10% to 50%
+
+        target_r = color_1[0] * glow
+        target_g = color_1[1] * glow
+        target_b = color_1[2] * glow
+        target_w = bass * 40
+        target_m = max(30, glow * 200)
+
+        # Smooth 20% decay — visible but not stuck
+        decay = 0.20
+        self.out_r = self.out_r + (target_r - self.out_r) * decay
+        self.out_g = self.out_g + (target_g - self.out_g) * decay
+        self.out_b = self.out_b + (target_b - self.out_b) * decay
+        self.out_w = self.out_w + (target_w - self.out_w) * decay
+        self.out_master = self.out_master + (target_m - self.out_master) * decay
+        self.out_strobe = 0
+
+    # ============================================================
+    # AUTO-BEHAVIOR DETECTION (Non-AI / Loopback Mode)
+    # ============================================================
+    def _detect_auto_behavior(self, volume, kick_i, snare_i, current_time, beats_per_sec):
+        """Analyze real-time energy to auto-pick behavior for loopback mode."""
+        self.volume_history.append(volume)
+
+        if len(self.volume_history) < 30:
+            return "beat_reactive"
+
+        history = list(self.volume_history)
+        past_energy = float(np.mean(history[:60]))
+        recent_energy = float(np.mean(history[-30:]))
+        overall_avg = float(np.mean(history))
+
+        time_in_state = current_time - self.energy_state_since
+        self.drop_cooldown = max(0, self.drop_cooldown - 0.023)
+
+        if self.energy_state == "calm":
+            if recent_energy > past_energy * 1.8 and recent_energy > MIN_VOLUME_GATE * 3:
+                self.energy_state = "building"
+                self.energy_state_since = current_time
+            elif beats_per_sec > 2.5 and recent_energy > overall_avg * 1.3:
+                self.energy_state = "high"
+                self.energy_state_since = current_time
+
+        elif self.energy_state == "building":
+            if recent_energy > past_energy * 2.5 and self.drop_cooldown <= 0:
+                self.energy_state = "high"
+                self.energy_state_since = current_time
+                self.drop_cooldown = 5.0
+            elif recent_energy < past_energy * 0.6:
+                self.energy_state = "calm"
+                self.energy_state_since = current_time
+            elif time_in_state > 12.0:
+                self.energy_state = "high" if beats_per_sec > 2.0 else "calm"
+                self.energy_state_since = current_time
+
+        elif self.energy_state == "high":
+            if recent_energy < overall_avg * 0.5 and time_in_state > 3.0:
+                self.energy_state = "dropping"
+                self.energy_state_since = current_time
+            elif time_in_state > 20.0:
+                self.energy_state = "calm"
+                self.energy_state_since = current_time
+
+        elif self.energy_state == "dropping":
+            if time_in_state > 4.0:
+                self.energy_state = "calm"
+                self.energy_state_since = current_time
+            elif recent_energy > overall_avg * 1.5:
+                self.energy_state = "high"
+                self.energy_state_since = current_time
+
+        if self.energy_state == "calm":
+            return "slow_breathe" if beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7 else "beat_reactive"
+        elif self.energy_state == "building":
+            return "buildup_ramp"
+        elif self.energy_state == "high":
+            if beats_per_sec > 3.0:
+                return "blackout_punch"
+            elif beats_per_sec > 2.0:
+                return "bass_white_blast"
+            return "fast_pulse"
+        elif self.energy_state == "dropping":
+            return "slow_breathe"
+        return "beat_reactive"
+
+    # ============================================================
+    # CORE AUDIO PROCESSING
+    # ============================================================
+    def process_audio(self, indata, input_format="int16", elapsed_seconds=None, actual_sample_rate=None):
+        """Core engine: FFT → onset detection → behavior dispatch → DMX output."""
+        self.frame_counter += 1
+        is_loopback = (elapsed_seconds is None)
+        sr = actual_sample_rate or SAMPLE_RATE
+
+        # --- Decode ---
+        if isinstance(indata, bytes):
+            if input_format == "float32":
+                audio_data = np.frombuffer(indata, dtype=np.float32)
+            else:
+                audio_data = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            audio_data = indata
+
+        if len(audio_data) > 0 and len(audio_data) % 2 == 0:
+            mono = (audio_data[0::2] + audio_data[1::2]) / 2.0
+        else:
+            mono = audio_data
+
+        volume = float(np.sqrt(np.mean(mono ** 2))) if len(mono) > 0 else 0.0
+
+        # Debug logging for first 50 frames in loopback mode
+        if is_loopback and self.frame_counter <= 50 and self.frame_counter % 10 == 0:
+            logger.debug(f"[LOOPBACK frame {self.frame_counter}] vol={volume:.6f} samples={len(mono)} sr={sr}")
+
+        vol_gate = LOOPBACK_VOLUME_GATE if is_loopback else MIN_VOLUME_GATE
+        if volume < vol_gate:
+            self.out_r *= 0.92; self.out_g *= 0.92; self.out_b *= 0.92
+            self.out_w *= 0.92; self.out_master *= 0.92
+            self.send_dmx(self.out_master, self.out_r, self.out_g, self.out_b, self.out_w, 0)
+            return
+
+        # --- FFT ---
+        N = len(mono)
+        if N == 0:
+            return
+
+        yf = np.fft.rfft(mono)
+        fft_data = np.abs(yf) / N
+        fft_freqs = np.fft.rfftfreq(N, 1.0 / sr)  # Use actual sample rate, not hardcoded
+
+        kick_mag = get_band_mag(fft_data, fft_freqs, KICK_LO, KICK_HI)
+        snare_mag = get_band_mag(fft_data, fft_freqs, SNARE_LO, SNARE_HI)
+        mid_mag = get_band_mag(fft_data, fft_freqs, MID_LO, MID_HI)
+        hihat_mag = get_band_mag(fft_data, fft_freqs, HIHAT_LO, HIHAT_HI)
+
+        self.agc_kick += AGC_SPEED * (kick_mag - self.agc_kick)
+        self.agc_snare += AGC_SPEED * (snare_mag - self.agc_snare)
+        self.agc_mid += AGC_SPEED * (mid_mag - self.agc_mid)
+        self.agc_hihat += AGC_SPEED * (hihat_mag - self.agc_hihat)
+
+        # Spectral flux
+        kick_flux = max(0.0, kick_mag - self.prev_kick_mag)
+        snare_flux = max(0.0, snare_mag - self.prev_snare_mag)
+        hihat_flux = max(0.0, hihat_mag - self.prev_hihat_mag)
+
+        agc_thresh = LOOPBACK_AGC_THRESH if is_loopback else 0.7
+        kick_hit = max(0.0, kick_mag - self.agc_kick * agc_thresh)
+        snare_hit = max(0.0, snare_mag - self.agc_snare * agc_thresh)
+        mid_hit = max(0.0, mid_mag - self.agc_mid * 0.4)
+        hihat_hit = max(0.0, hihat_mag - self.agc_hihat * 0.4)
+
+        gain_mult = LOOPBACK_GAIN_BOOST if is_loopback else 1.0
+        kick_i = min(1.0, (kick_flux * 0.6 + kick_hit * 0.4) * KICK_GAIN * gain_mult)
+        snare_i = min(1.0, (snare_flux * 0.6 + snare_hit * 0.4) * SNARE_GAIN * gain_mult)
+        hihat_i = min(1.0, (hihat_flux * 0.5 + hihat_hit * 0.5) * HIHAT_GAIN * gain_mult)
+        mid_i = min(1.0, mid_hit * MID_GAIN * gain_mult)
+
+        self.prev_kick_mag = kick_mag
+        self.prev_snare_mag = snare_mag
+        self.prev_hihat_mag = hihat_mag
+
+        # --- Beat registration ---
+        current_time = time.time()
+        kick_thresh = 0.12 if is_loopback else 0.3
+        snare_thresh = 0.15 if is_loopback else 0.35
+
+        is_kick = kick_i > kick_thresh and (current_time - self.last_beat_time) > ONSET_COOLDOWN
+        is_snare = snare_i > snare_thresh and (current_time - self.last_beat_time) > ONSET_COOLDOWN
+
+        if is_kick or is_snare:
+            self.last_beat_time = current_time
+            self.beat_timestamps.append(current_time)
+            self.total_beat_count += 1
+
+            rotation_interval = 16 if self.energy_state == "high" else 32
+            if self.total_beat_count % rotation_interval == 0:
+                self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
+
+        self.beat_timestamps = [t for t in self.beat_timestamps if current_time - t < 3.0]
+        beats_per_sec = len(self.beat_timestamps) / 3.0
+
+        # --- Determine cue/behavior ---
+        cue = None
+        if is_loopback:
+            # LOOPBACK: Skip behavior detection entirely.
+            # Use direct energy-to-light mapping for maximum responsiveness.
+            t = self.frame_counter * BLOCK_SIZE / sr
+
+            # Rotate palette every 8 kicks (creative color changes on beats)
+            if is_kick and self.total_beat_count % 8 == 0:
+                self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
+
+            kick_color, accent_color = self.palettes[self.current_palette_idx]
+            self._render_loopback_direct(
+                kick_mag, snare_mag, mid_mag, hihat_mag,
+                kick_i, snare_i, hihat_i, mid_i,
+                is_kick, is_snare,
+                kick_color, accent_color, volume, t
+            )
+        else:
+            if self.synced_cues:
+                cue = self._get_active_cue(elapsed_seconds)
+                if cue:
+                    kick_color = cue["color_1"]
+                    accent_color = cue["color_2"]
+                    behavior = cue.get("behavior", "beat_reactive")
+                else:
+                    kick_color, accent_color = self.palettes[self.current_palette_idx]
+                    behavior = "beat_reactive"
+            else:
+                kick_color, accent_color = self.palettes[self.current_palette_idx]
+                behavior = "beat_reactive"
+
+            # --- Dispatch ---
+            t = elapsed_seconds if elapsed_seconds is not None else self.frame_counter * BLOCK_SIZE / SAMPLE_RATE
+            renderer = self._behavior_map.get(behavior, self._render_beat_reactive)
+            renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                     kick_color, accent_color, volume, cue or {"energy": 7, "dimmer": 80}, t)
+
+        self.send_dmx(self.out_master, self.out_r, self.out_g, self.out_b, self.out_w, self.out_strobe)
+
+    # ==========================================
+    # MODE: SYNCED WAV PLAYBACK (I4 FIX: try/finally)
+    # ==========================================
+    def run_synced_mode(self, show_file="current_show.json"):
+        import wave as wave_mod
+
+        self._init_hardware()
+        audio_path = self.load_ai_show(show_file)
+        if not audio_path or not os.path.exists(audio_path):
+            logger.error(f"No valid audio file in {show_file}!")
+            return
+
+        logger.info(f"[SYNCED] Playing: {os.path.basename(audio_path)}")
+        if self.synced_cues:
+            behaviors = set(c["behavior"] for c in self.synced_cues)
+            logger.info(f"[SYNCED] {len(self.synced_cues)} cues, behaviors: {behaviors}")
+
+        wf = wave_mod.open(audio_path, 'rb')
+        p = pyaudio.PyAudio()
+        stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
+                        channels=wf.getnchannels(),
+                        rate=wf.getframerate(),
+                        output=True)
+
+        sample_rate = wf.getframerate()
+        total_frames = wf.getnframes()
+        self.playback_duration = total_frames / sample_rate
+        self.playback_state = "playing"
+        state_write_counter = 0
+
+        try:
+            chunk_size = 1024
+            data = wf.readframes(chunk_size)
+            frames_played = 0
+            last_cue_name = ""
+
+            while data:
+                # --- Check for commands (seek, pause, resume) ---
+                cmd = self._check_playback_command()
+                if cmd:
+                    action = cmd.get("command")
+                    if action == "seek":
+                        target = float(cmd.get("position", 0))
+                        target_frame = int(target * sample_rate)
+                        target_frame = max(0, min(target_frame, total_frames - 1))
+                        wf.setpos(target_frame)
+                        frames_played = target_frame
+                        logger.info(f"[SEEK] Jumped to {target:.1f}s (frame {target_frame})")
+                        data = wf.readframes(chunk_size)
+                        continue
+                    elif action == "pause":
+                        self.is_paused = True
+                        logger.info("[PAUSE]")
+                    elif action == "resume":
+                        self.is_paused = False
+                        logger.info("[RESUME]")
+                    elif action == "stop":
+                        logger.info("[STOP] Received stop command")
+                        break
+
+                # --- Pause loop ---
+                if self.is_paused:
+                    state_write_counter += 1
+                    if state_write_counter % 5 == 0:
+                        self.playback_position = frames_played / sample_rate
+                        self._write_playback_state()
+                    time.sleep(0.05)
+                    continue
+
+                # --- Normal playback ---
+                stream.write(data)
+                elapsed = frames_played / sample_rate
+                self.playback_position = elapsed
+                self.process_audio(data, input_format="int16", elapsed_seconds=elapsed)
+
+                if self.synced_cues:
+                    cue = self._get_active_cue(elapsed)
+                    if cue:
+                        if cue["name"] != last_cue_name:
+                            last_cue_name = cue["name"]
+                            logger.info(f"[CUE {elapsed:.1f}s] {cue['name']} → {cue['behavior']}")
+                        self.current_cue_name = cue.get("name", "")
+                        self.current_behavior = cue.get("behavior", "beat_reactive")
+
+                # Write state every ~10 frames (~230ms at 44.1kHz/1024)
+                state_write_counter += 1
+                if state_write_counter % 10 == 0:
+                    self._write_playback_state()
+
+                frames_played += chunk_size
+                data = wf.readframes(chunk_size)
+
+            # Playback finished naturally
+            self.playback_state = "stopped"
+            self.playback_position = self.playback_duration
+            self._write_playback_state()
+        finally:
+            self.send_dmx(0, 0, 0, 0, 0, 0)
+            self.playback_state = "stopped"
+            self._write_playback_state()
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            wf.close()
+            self._cleanup_ipc_files()
+
+    # ==========================================
+    # MODE: LIVE LOOPBACK
+    # ==========================================
+    def run_loopback_mode(self, show_file=None):
+        self._init_hardware()
+        if show_file:
+            self.load_ai_show(show_file)
+
+        p = pyaudio.PyAudio()
+        try:
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            if not default_speakers["isLoopbackDevice"]:
+                for loopback in p.get_loopback_device_info_generator():
+                    if default_speakers["name"] in loopback["name"]:
+                        default_speakers = loopback
+                        break
+            logger.info(f"[LOOPBACK] {default_speakers['name']}")
+        except OSError as e:
+            logger.error(f"WASAPI error: {e}")
+            return
+
+        # Store actual sample rate for FFT calculations
+        device_sr = int(default_speakers["defaultSampleRate"])
+        logger.info(f"[LOOPBACK] Device sample rate: {device_sr}Hz")
+
+        def callback(in_data, frame_count, time_info, status):
+            try:
+                self.process_audio(in_data, input_format="float32", actual_sample_rate=device_sr)
+            except Exception as ex:
+                logger.error(f"Audio error: {ex}")
+            return (in_data, pyaudio.paContinue)
+
+        stream = p.open(format=pyaudio.paFloat32,
+                        channels=default_speakers["maxInputChannels"],
+                        rate=device_sr,
+                        frames_per_buffer=BLOCK_SIZE,
+                        input=True,
+                        input_device_index=default_speakers["index"],
+                        stream_callback=callback)
+        try:
+            with stream:
+                while stream.is_active():
+                    time.sleep(0.1)
+        finally:
+            self.send_dmx(0, 0, 0, 0, 0, 0)
 
 
 # ==========================================
-# MAIN ENTRY POINT
+# MAIN
 # ==========================================
 if __name__ == "__main__":
     mode = "synced"
     show_file = "current_show.json"
-
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -476,18 +959,21 @@ if __name__ == "__main__":
         else:
             i += 1
 
+    engine = DMXEngine()
+
     try:
-        logger.info(f"==== AI Music Light Controller V7 ====")
+        logger.info(f"==== AI Music Light Controller V9 ====")
         logger.info(f"Mode: {mode.upper()} | Show: {show_file}")
-
         if mode == "loopback":
-            run_loopback_mode(show_file)
+            engine.run_loopback_mode(show_file)
         else:
-            run_synced_mode(show_file)
-
+            engine.run_synced_mode(show_file)
     except KeyboardInterrupt:
-        send_dmx(0, 0, 0, 0, 0, 0)
-        logger.info("Lights off. Goodbye!")
+        engine.send_dmx(0, 0, 0, 0, 0, 0)
+        logger.info("Lights off.")
+    except RuntimeError as e:
+        logger.error(str(e))
+        sys.exit(1)
     except Exception as e:
-        send_dmx(0, 0, 0, 0, 0, 0)
-        logger.exception(f"Fatal Error: {e}")
+        engine.send_dmx(0, 0, 0, 0, 0, 0)
+        logger.exception(f"Fatal: {e}")

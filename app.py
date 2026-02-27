@@ -74,7 +74,11 @@ os.makedirs(SHOWS_DIR, exist_ok=True)
 # ==========================================
 _active_process = None
 _active_lock = threading.Lock()
+_generation_lock = threading.Lock()  # C2 FIX: separate lock for generation status
 _generation_status = {"active": False, "message": "", "progress": 0}
+
+# I6 FIX: In-memory index of video_id → show_id (built on startup, updated on add/delete)
+_video_index: dict[str, str] = {}
 
 
 # ==========================================
@@ -85,13 +89,22 @@ _generation_status = {"active": False, "message": "", "progress": 0}
 # ==========================================
 class GenerateRequest(BaseModel):
     url: str
-    regenerate: bool = False  # If True, skip download but re-run AI generation
+    regenerate: bool = False
+    start_time: float | None = None  # Optional trim start (seconds)
+    end_time: float | None = None    # Optional trim end (seconds)
 
 class PlayRequest(BaseModel):
     show_id: str
 
 class LoopbackRequest(BaseModel):
     show_id: str | None = None
+
+class SeekRequest(BaseModel):
+    position: float  # Seconds to seek to
+
+# IPC file paths (shared with music_light.py)
+_PLAYBACK_STATE_FILE = os.path.join(BASE_DIR, "playback_state.json")
+_PLAYBACK_COMMAND_FILE = os.path.join(BASE_DIR, "playback_command.json")
 
 
 # ==========================================
@@ -128,17 +141,23 @@ def _get_audio_duration(filepath: str) -> float:
         return 0.0
 
 
-def _save_show_to_library(show_json_path: str, name: str | None = None) -> str | None:
+def _save_show_to_library(show_json_path: str, name: str | None = None) -> str:
     """
     Copy a show.json and its audio file into the shows/ library.
-    Returns the show_id (folder name) or None on failure.
+    Returns the show_id (folder name).
+    Raises ValueError with context on failure (I5 FIX).
     """
-    with open(show_json_path, 'r') as f:
-        data = json.load(f)
+    try:
+        with open(show_json_path, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Cannot read show file '{show_json_path}': {e}")
 
     audio_src = data.get("audio_file", "")
+    if not audio_src:
+        raise ValueError("Show JSON has no 'audio_file' field")
     if not os.path.exists(audio_src):
-        return None
+        raise ValueError(f"Audio file not found: {audio_src}")
 
     # Generate a clean folder name from the audio filename
     audio_basename = os.path.splitext(os.path.basename(audio_src))[0]
@@ -153,7 +172,6 @@ def _save_show_to_library(show_json_path: str, name: str | None = None) -> str |
     if not os.path.exists(audio_dest):
         shutil.copy2(audio_src, audio_dest)
 
-    # Update the show JSON to point to the local copy
     data["audio_file"] = os.path.abspath(audio_dest)
 
     # Build metadata
@@ -162,9 +180,7 @@ def _save_show_to_library(show_json_path: str, name: str | None = None) -> str |
     phrases = plan.get("phrases", [])
     cues = plan.get("cues", [])
 
-    # Preserve video_id if it was set by a previous generation
     existing_video_id = data.get("metadata", {}).get("video_id")
-    # Also try to extract from source_url if present
     source_url = data.get("source_url", "")
     video_id = existing_video_id or _extract_video_id(source_url) or None
 
@@ -185,6 +201,10 @@ def _save_show_to_library(show_json_path: str, name: str | None = None) -> str |
     with open(show_file, 'w') as f:
         json.dump(data, f, indent=2)
 
+    # I6 FIX: Update in-memory index
+    if video_id:
+        _video_index[video_id] = show_id
+
     return show_id
 
 
@@ -198,21 +218,31 @@ def _kill_active_process():
         except subprocess.TimeoutExpired:
             _active_process.kill()
         _active_process = None
+    # FIX #5: Purge stale IPC files to prevent ghost state
+    for ipc_file in (_PLAYBACK_STATE_FILE, _PLAYBACK_COMMAND_FILE,
+                     _PLAYBACK_STATE_FILE + ".tmp", _PLAYBACK_COMMAND_FILE + ".tmp"):
+        try:
+            if os.path.exists(ipc_file):
+                os.remove(ipc_file)
+        except OSError:
+            pass
 
 
-def _find_existing_show_by_audio(url: str) -> dict | None:
-    """
-    Check if a show already exists for the SAME YouTube video.
-    Matches by video ID extracted from the URL — not by filename.
-    Returns show info dict or None.
-    """
-    video_id = _extract_video_id(url)
-    
-    if not video_id:
-        # Can't extract ID (not a valid YouTube URL) — skip matching
-        return None
-    
-    # Pass 1: Check shows in library by stored video_id
+def _resolve_show_path(show_id: str) -> str:
+    """Resolve show directory path with path-traversal protection.
+    Returns the validated absolute show dir path.
+    Raises HTTPException(400) if the path escapes SHOWS_DIR."""
+    show_dir = os.path.realpath(os.path.join(SHOWS_DIR, show_id))
+    if not show_dir.startswith(os.path.realpath(SHOWS_DIR)):
+        raise HTTPException(400, "Invalid show ID")
+    return show_dir
+
+
+def _build_video_index():
+    """I6 FIX: Build in-memory video_id → show_id index on startup."""
+    _video_index.clear()
+    if not os.path.exists(SHOWS_DIR):
+        return
     for folder in os.listdir(SHOWS_DIR):
         show_file = os.path.join(SHOWS_DIR, folder, "show.json")
         if not os.path.isfile(show_file):
@@ -220,24 +250,46 @@ def _find_existing_show_by_audio(url: str) -> dict | None:
         try:
             with open(show_file, 'r') as fh:
                 data = json.load(fh)
-            stored_id = data.get("metadata", {}).get("video_id")
-            if stored_id == video_id:
+            vid = data.get("metadata", {}).get("video_id")
+            if vid:
+                _video_index[vid] = folder
+        except Exception:
+            pass
+    logger.info(f"Video index built: {len(_video_index)} entries")
+
+
+def _find_existing_show_by_audio(url: str) -> dict | None:
+    """
+    Check if a show already exists for the SAME YouTube video.
+    Uses in-memory index for O(1) lookup (I6 FIX).
+    """
+    video_id = _extract_video_id(url)
+    if not video_id:
+        return None
+    
+    # O(1) lookup from in-memory index
+    if video_id in _video_index:
+        folder = _video_index[video_id]
+        show_file = os.path.join(SHOWS_DIR, folder, "show.json")
+        if os.path.isfile(show_file):
+            try:
+                with open(show_file, 'r') as fh:
+                    data = json.load(fh)
                 audio_path = data.get("audio_file", "")
                 return {
                     "show_id": folder,
                     "title": data.get("metadata", {}).get("title", folder),
                     "audio_file": audio_path if os.path.exists(audio_path) else None,
                 }
-        except Exception:
-            pass
+            except Exception:
+                pass
     
-    # Pass 2: Check if raw audio exists in youtube_audio/ with the video ID in filename
-    # (yt-dlp appends [VIDEO_ID] to filenames by default)
+    # Fallback: Check if raw audio exists in youtube_audio/
     if os.path.exists(AUDIO_DIR):
         for f in os.listdir(AUDIO_DIR):
             if f.endswith('.wav') and video_id in f:
                 return {
-                    "show_id": None,  # Audio exists but no show yet
+                    "show_id": None,
                     "audio_file": os.path.join(AUDIO_DIR, f),
                     "title": None,
                 }
@@ -306,9 +358,10 @@ def import_current_show():
     if not os.path.exists(current):
         raise HTTPException(404, "No current_show.json found. Generate a show first.")
 
-    show_id = _save_show_to_library(current)
-    if not show_id:
-        raise HTTPException(400, "Failed to import — audio file missing.")
+    try:
+        show_id = _save_show_to_library(current)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     return {"message": f"Imported as '{show_id}'", "show_id": show_id}
 
@@ -326,14 +379,20 @@ def generate_show(req: GenerateRequest):
     if not req.url.strip():
         raise HTTPException(400, "No YouTube URL provided.")
 
-    if _generation_status["active"]:
-        raise HTTPException(409, "A show is already being generated. Please wait.")
+    # C2 FIX: Atomic check-and-set with lock
+    with _generation_lock:
+        if _generation_status["active"]:
+            raise HTTPException(409, "A show is already being generated. Please wait.")
+        _generation_status = {"active": True, "message": "Starting...", "progress": 0}
 
     # Check if we already have this song
-    existing = _find_existing_show_by_audio(req.url.strip())
+    # FIX #1: Skip dedup when trim range is specified (different segment = different show)
+    has_trim = req.start_time is not None or req.end_time is not None
+    existing = None if has_trim else _find_existing_show_by_audio(req.url.strip())
 
     if existing and existing.get("show_id") and not req.regenerate:
-        # Show already exists and user didn't ask to regenerate
+        with _generation_lock:
+            _generation_status = {"active": False, "message": "", "progress": 0}
         return {
             "message": f"Show already exists: '{existing['title']}'",
             "status": "exists",
@@ -343,28 +402,43 @@ def generate_show(req: GenerateRequest):
 
     def _run_generation():
         global _generation_status
+        proc = None
         
         current = os.path.join(BASE_DIR, "current_show.json")
         
-        # DELETE stale current_show.json BEFORE starting.
-        # If the subprocess fails, we must NOT reuse old data.
         if os.path.exists(current):
             os.remove(current)
             logger.info("Removed stale current_show.json")
         
-        # Build the command for youtube_analyzer.py
-        cmd = [PYTHON_EXE, "-u", "youtube_analyzer.py"]  # -u = unbuffered output
+        cmd = [PYTHON_EXE, "-u", "youtube_analyzer.py"]
         
         if existing and existing.get("audio_file") and os.path.exists(existing["audio_file"]):
-            _generation_status = {"active": True, "message": "Regenerating AI plan (audio cached)...", "progress": 40}
+            with _generation_lock:
+                _generation_status = {"active": True, "message": "Regenerating AI plan (audio cached)...", "progress": 40}
             cmd.extend(["--skip-download", "--audio", existing["audio_file"]])
             logger.info(f"Regenerating with cached audio: {existing['audio_file']}")
         else:
-            _generation_status = {"active": True, "message": "Starting download pipeline...", "progress": 5}
+            with _generation_lock:
+                _generation_status = {"active": True, "message": "Starting download pipeline...", "progress": 5}
             cmd.append(req.url.strip())
             logger.info(f"Full generation for URL: {req.url.strip()}")
         
+        # Pass time range if specified
+        if req.start_time is not None:
+            cmd.extend(["--start", str(req.start_time)])
+        if req.end_time is not None:
+            cmd.extend(["--end", str(req.end_time)])
+        
         logger.debug(f"Command: {' '.join(cmd)}")
+        
+        # I3 FIX: Watchdog timer kills hung subprocess after 300s
+        def _watchdog():
+            nonlocal proc
+            import time as _t
+            _t.sleep(300)
+            if proc and proc.poll() is None:
+                logger.error("Watchdog: killing hung subprocess after 300s")
+                proc.kill()
         
         try:
             proc = subprocess.Popen(
@@ -372,6 +446,9 @@ def generate_show(req: GenerateRequest):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1
             )
+            
+            watchdog = threading.Thread(target=_watchdog, daemon=True)
+            watchdog.start()
             
             all_output = []
             for line in proc.stdout:
@@ -381,54 +458,54 @@ def generate_show(req: GenerateRequest):
                 all_output.append(line)
                 logger.debug(f"[GEN] {line}")
                 
-                # Parse progress from youtube_analyzer.py output
-                if "[DOWNLOAD]" in line or "[YT-DLP]" in line:
-                    try:
-                        parts = line.split("]", 1)[-1].strip().split()
-                        if parts:
-                            first_num = parts[0].replace("%", "")
-                            dl_pct = float(first_num)
-                            if 0 <= dl_pct <= 100:
-                                mapped = 5 + (dl_pct / 100) * 25
-                                _generation_status["message"] = f"Downloading audio... {dl_pct:.0f}%"
-                                _generation_status["progress"] = int(mapped)
-                    except (ValueError, IndexError):
-                        pass
-                elif "[CONVERT]" in line:
-                    _generation_status["message"] = "Converting to WAV format..."
-                    _generation_status["progress"] = 32
-                elif "Download phase complete" in line:
-                    _generation_status["message"] = "Download complete! Starting analysis..."
-                    _generation_status["progress"] = 35
-                elif "Downloading" in line:
-                    _generation_status["message"] = "Downloading audio from YouTube..."
-                    _generation_status["progress"] = 8
-                elif "Using existing" in line or "Using provided" in line or "Skipping download" in line:
-                    _generation_status["message"] = "Using cached audio file"
-                    _generation_status["progress"] = 35
-                elif "deep audio analysis" in line.lower() or "Analyzing" in line:
-                    _generation_status["message"] = "Analyzing audio structure (FFT spectral analysis)..."
-                    _generation_status["progress"] = 45
-                elif "Deep analysis complete" in line or "Detected" in line:
-                    _generation_status["message"] = f"Audio analysis done. {line.split('Detected')[-1].strip() if 'Detected' in line else ''}"
-                    _generation_status["progress"] = 55
-                elif "TELEMETRY" in line:
-                    _generation_status["message"] = "Audio telemetry extracted!"
-                    _generation_status["progress"] = 60
-                elif "Sending" in line and ("GPT" in line or "Azure" in line or "OpenAI" in line):
-                    _generation_status["message"] = "Sending to Azure GPT for lighting design..."
-                    _generation_status["progress"] = 65
-                elif "AI DMX LIGHTING" in line or "LIGHTING SCRIPT" in line:
-                    _generation_status["message"] = "AI lighting plan received!"
-                    _generation_status["progress"] = 80
-                elif "Show saved" in line:
-                    _generation_status["message"] = "Show file saved!"
-                    _generation_status["progress"] = 85
-                elif "Error" in line or "Failed" in line or "[-]" in line:
-                    _generation_status["message"] = line
-                    logger.warning(f"Potential error: {line}")
+                with _generation_lock:
+                    if "[DOWNLOAD]" in line or "[YT-DLP]" in line:
+                        try:
+                            parts = line.split("]", 1)[-1].strip().split()
+                            if parts:
+                                first_num = parts[0].replace("%", "")
+                                dl_pct = float(first_num)
+                                if 0 <= dl_pct <= 100:
+                                    mapped = 5 + (dl_pct / 100) * 25
+                                    _generation_status["message"] = f"Downloading audio... {dl_pct:.0f}%"
+                                    _generation_status["progress"] = int(mapped)
+                        except (ValueError, IndexError):
+                            pass
+                    elif "[CONVERT]" in line:
+                        _generation_status["message"] = "Converting to WAV format..."
+                        _generation_status["progress"] = 32
+                    elif "Download phase complete" in line:
+                        _generation_status["message"] = "Download complete! Starting analysis..."
+                        _generation_status["progress"] = 35
+                    elif "Downloading" in line:
+                        _generation_status["message"] = "Downloading audio from YouTube..."
+                        _generation_status["progress"] = 8
+                    elif "Using existing" in line or "Using provided" in line or "Skipping download" in line:
+                        _generation_status["message"] = "Using cached audio file"
+                        _generation_status["progress"] = 35
+                    elif "deep audio analysis" in line.lower() or "Analyzing" in line:
+                        _generation_status["message"] = "Analyzing audio structure (FFT spectral analysis)..."
+                        _generation_status["progress"] = 45
+                    elif "Deep analysis complete" in line or "Detected" in line:
+                        _generation_status["message"] = f"Audio analysis done. {line.split('Detected')[-1].strip() if 'Detected' in line else ''}"
+                        _generation_status["progress"] = 55
+                    elif "TELEMETRY" in line:
+                        _generation_status["message"] = "Audio telemetry extracted!"
+                        _generation_status["progress"] = 60
+                    elif "Sending" in line and ("GPT" in line or "Azure" in line or "OpenAI" in line):
+                        _generation_status["message"] = "Sending to Azure GPT for lighting design..."
+                        _generation_status["progress"] = 65
+                    elif "AI DMX LIGHTING" in line or "LIGHTING SCRIPT" in line:
+                        _generation_status["message"] = "AI lighting plan received!"
+                        _generation_status["progress"] = 80
+                    elif "Show saved" in line:
+                        _generation_status["message"] = "Show file saved!"
+                        _generation_status["progress"] = 85
+                    elif "Error" in line or "Failed" in line or "[-]" in line:
+                        _generation_status["message"] = line
+                        logger.warning(f"Potential error: {line}")
                     
-            proc.wait(timeout=300)
+            proc.wait(timeout=30)  # stdout already closed, so this is just cleanup
             
             stderr = proc.stderr.read() if proc.stderr else ""
             if stderr:
@@ -437,19 +514,20 @@ def generate_show(req: GenerateRequest):
             if proc.returncode != 0:
                 error_msg = stderr[-300:] if stderr else (all_output[-1] if all_output else "Unknown error")
                 logger.error(f"youtube_analyzer.py exited with code {proc.returncode}: {error_msg}")
-                _generation_status = {"active": False, "message": f"Error: {error_msg}", "progress": 0}
+                with _generation_lock:
+                    _generation_status = {"active": False, "message": f"Error: {error_msg}", "progress": 0}
                 return
 
-            # Validate that current_show.json was actually written by this run
             if not os.path.exists(current):
                 logger.error("youtube_analyzer.py returned 0 but current_show.json was NOT created")
-                _generation_status = {"active": False, "message": "Generation failed — no show file created.", "progress": 0}
+                with _generation_lock:
+                    _generation_status = {"active": False, "message": "Generation failed — no show file created.", "progress": 0}
                 return
 
-            _generation_status["message"] = "Saving to library..."
-            _generation_status["progress"] = 90
+            with _generation_lock:
+                _generation_status["message"] = "Saving to library..."
+                _generation_status["progress"] = 90
 
-            # Inject source URL and video ID
             with open(current, 'r') as f:
                 show_data = json.load(f)
             
@@ -462,20 +540,26 @@ def generate_show(req: GenerateRequest):
             with open(current, 'w') as f:
                 json.dump(show_data, f, indent=2)
             
-            show_id = _save_show_to_library(current)
+            try:
+                show_id = _save_show_to_library(current)
+            except ValueError as e:
+                logger.error(f"Failed to save to library: {e}")
+                with _generation_lock:
+                    _generation_status = {"active": False, "message": f"Error: {e}", "progress": 0}
+                return
+
             logger.info(f"Show saved to library: {show_id}")
-            _generation_status = {
-                "active": False,
-                "message": f"Done! Show '{show_id}' saved.",
-                "progress": 100,
-                "show_id": show_id,
-            }
-        except subprocess.TimeoutExpired:
-            logger.error("Generation timed out after 5 minutes")
-            _generation_status = {"active": False, "message": "Timed out after 5 minutes.", "progress": 0}
+            with _generation_lock:
+                _generation_status = {
+                    "active": False,
+                    "message": f"Done! Show '{show_id}' saved.",
+                    "progress": 100,
+                    "show_id": show_id,
+                }
         except Exception as e:
             logger.exception(f"Fatal generation error: {e}")
-            _generation_status = {"active": False, "message": f"Fatal: {e}", "progress": 0}
+            with _generation_lock:
+                _generation_status = {"active": False, "message": f"Fatal: {e}", "progress": 0}
 
     thread = threading.Thread(target=_run_generation, daemon=True)
     thread.start()
@@ -487,13 +571,16 @@ def generate_show(req: GenerateRequest):
 @app.get("/api/shows/generate/status")
 def generation_status():
     """Poll the current show generation status."""
-    return _generation_status
+    with _generation_lock:
+        return dict(_generation_status)  # Return a copy
 
 
 @app.post("/api/play")
 def play_show(req: PlayRequest):
     """Start synced WAV playback of a saved show."""
-    show_file = os.path.join(SHOWS_DIR, req.show_id, "show.json")
+    # FIX #4: Path traversal protection
+    show_dir = _resolve_show_path(req.show_id)
+    show_file = os.path.join(show_dir, "show.json")
     if not os.path.isfile(show_file):
         raise HTTPException(404, f"Show '{req.show_id}' not found.")
 
@@ -513,7 +600,9 @@ def start_loopback(req: LoopbackRequest):
     cmd = [PYTHON_EXE, "music_light.py", "--mode", "loopback"]
 
     if req.show_id:
-        show_file = os.path.join(SHOWS_DIR, req.show_id, "show.json")
+        # FIX #4: Path traversal protection
+        show_dir = _resolve_show_path(req.show_id)
+        show_file = os.path.join(show_dir, "show.json")
         if os.path.isfile(show_file):
             cmd.extend(["--show", show_file])
 
@@ -535,24 +624,91 @@ def stop_playback():
     return {"message": "Playback stopped." if was_playing else "Nothing was playing."}
 
 
+@app.get("/api/playback/position")
+def get_playback_position():
+    """Read current playback position from the IPC state file."""
+    if not os.path.exists(_PLAYBACK_STATE_FILE):
+        return {"position": 0, "duration": 0, "state": "stopped", "cue_name": "", "behavior": ""}
+    try:
+        with open(_PLAYBACK_STATE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {"position": 0, "duration": 0, "state": "stopped", "cue_name": "", "behavior": ""}
+
+
+def _write_playback_command(command: dict):
+    """Write a command file for music_light.py to pick up."""
+    cmd_path = _PLAYBACK_COMMAND_FILE
+    tmp = cmd_path + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(command, f)
+    os.replace(tmp, cmd_path)
+
+
+@app.post("/api/playback/seek")
+def seek_playback(req: SeekRequest):
+    """Seek to a position in the current synced playback."""
+    with _active_lock:
+        if _active_process is None or _active_process.poll() is not None:
+            raise HTTPException(400, "No playback active")
+    _write_playback_command({"command": "seek", "position": req.position})
+    return {"message": f"Seeking to {req.position:.1f}s"}
+
+
+@app.post("/api/playback/pause")
+def pause_playback():
+    """Pause the current synced playback."""
+    with _active_lock:
+        if _active_process is None or _active_process.poll() is not None:
+            raise HTTPException(400, "No playback active")
+    _write_playback_command({"command": "pause"})
+    return {"message": "Paused"}
+
+
+@app.post("/api/playback/resume")
+def resume_playback():
+    """Resume paused synced playback."""
+    with _active_lock:
+        if _active_process is None or _active_process.poll() is not None:
+            raise HTTPException(400, "No playback active")
+    _write_playback_command({"command": "resume"})
+    return {"message": "Resumed"}
+
+
 @app.get("/api/status")
 def playback_status():
     """Get current playback and generation status."""
     with _active_lock:
         is_playing = _active_process is not None and _active_process.poll() is None
 
+    # Include position data if available
+    position_data = {}
+    if is_playing and os.path.exists(_PLAYBACK_STATE_FILE):
+        try:
+            with open(_PLAYBACK_STATE_FILE, 'r') as f:
+                position_data = json.load(f)
+        except Exception:
+            pass
+
     return {
         "playing": is_playing,
         "generation": _generation_status,
+        "playback": position_data,
     }
 
 
 @app.delete("/api/shows/{show_id}")
 def delete_show(show_id: str):
     """Delete a show from the library."""
-    show_dir = os.path.join(SHOWS_DIR, show_id)
+    show_dir = _resolve_show_path(show_id)
     if not os.path.isdir(show_dir):
         raise HTTPException(404, "Show not found.")
+
+    # I6 FIX: Remove from index
+    for vid, sid in list(_video_index.items()):
+        if sid == show_id:
+            del _video_index[vid]
+            break
 
     shutil.rmtree(show_dir)
     return {"message": f"Show '{show_id}' deleted."}
@@ -562,11 +718,17 @@ def delete_show(show_id: str):
 # STARTUP
 # ==========================================
 if __name__ == "__main__":
+    # I6 FIX: Build video index on startup
+    _build_video_index()
+
     # Auto-import current_show.json on first run
     current = os.path.join(BASE_DIR, "current_show.json")
     if os.path.exists(current) and not os.listdir(SHOWS_DIR):
-        sid = _save_show_to_library(current)
-        print(f"[+] Auto-imported current_show.json as '{sid}'")
+        try:
+            sid = _save_show_to_library(current)
+            print(f"[+] Auto-imported current_show.json as '{sid}'")
+        except ValueError as e:
+            print(f"[WARN] Auto-import failed: {e}")
 
     print("=" * 50)
     print("  DMX Show Manager API (FastAPI)")
