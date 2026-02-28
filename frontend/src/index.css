@@ -727,7 +727,7 @@ body::before {
 }
 
 .profile-select option {
-  background: var(--bg);
-  color: var(--text-primary);
+  background: #1a1a2e;
+  color: #e0e0e0;
   padding: 8px;
 }
