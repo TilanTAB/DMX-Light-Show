@@ -83,6 +83,8 @@ def download_youtube_audio(url):
         "--progress",            # Always show progress even when piped
         "--downloader", "curl",
         "--downloader-args", "-k",  # Skip SSL check where urllib hangs
+        "--concurrent-fragments", "4",  # Download 4 fragments in parallel (faster)
+        "--retries", "5",        # Retry on network errors (important for long downloads)
         "--format", "bestaudio/best",
         "--extract-audio",
         "--audio-format", "wav",

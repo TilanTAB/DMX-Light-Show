@@ -434,14 +434,29 @@ def generate_show(req: GenerateRequest):
         
         logger.debug(f"Command: {' '.join(cmd)}")
         
-        # I3 FIX: Watchdog timer kills hung subprocess after 300s
+        # Activity-based watchdog: kills only if no output for 120s (not a fixed timeout).
+        # Long downloads that produce steady progress are safe.
+        last_activity = [time.time()]  # mutable container for thread access
+        MAX_TOTAL_SECONDS = 1800  # 30 minute absolute max
+        IDLE_TIMEOUT = 120  # Kill if no output for 2 minutes
+        
         def _watchdog():
             nonlocal proc
-            import time as _t
-            _t.sleep(300)
-            if proc and proc.poll() is None:
-                logger.error("Watchdog: killing hung subprocess after 300s")
-                proc.kill()
+            start_time = time.time()
+            while True:
+                time.sleep(10)
+                if proc is None or proc.poll() is not None:
+                    return  # Process finished
+                elapsed = time.time() - start_time
+                idle = time.time() - last_activity[0]
+                if idle > IDLE_TIMEOUT:
+                    logger.error(f"Watchdog: killing subprocess — no output for {idle:.0f}s")
+                    proc.kill()
+                    return
+                if elapsed > MAX_TOTAL_SECONDS:
+                    logger.error(f"Watchdog: killing subprocess — exceeded {MAX_TOTAL_SECONDS}s total")
+                    proc.kill()
+                    return
         
         try:
             proc = subprocess.Popen(
@@ -458,6 +473,7 @@ def generate_show(req: GenerateRequest):
                 line = line.strip()
                 if not line:
                     continue
+                last_activity[0] = time.time()  # Keep watchdog alive
                 all_output.append(line)
                 logger.debug(f"[GEN] {line}")
                 

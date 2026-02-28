@@ -1,0 +1,69 @@
+{
+    "name": "Chill Ambient",
+    "description": "Slow color fades driven by mids/vocals. Gentle glow, no harsh flashes. Great for background music.",
+    "gain_boost": 30.0,
+    "volume_gate": 0.00005,
+    "agc_thresh": 0.5,
+    "kick_thresh": 0.15,
+    "snare_thresh": 0.20,
+    "onset_cooldown": 0.25,
+    "palettes": [
+        [
+            [
+                80,
+                0,
+                200
+            ],
+            [
+                0,
+                100,
+                180
+            ]
+        ],
+        [
+            [
+                0,
+                150,
+                180
+            ],
+            [
+                100,
+                0,
+                150
+            ]
+        ],
+        [
+            [
+                50,
+                0,
+                150
+            ],
+            [
+                0,
+                80,
+                200
+            ]
+        ],
+        [
+            [
+                0,
+                100,
+                100
+            ],
+            [
+                80,
+                0,
+                120
+            ]
+        ]
+    ],
+    "color_cycle_mode": "time",
+    "color_cycle_interval": 8.0,
+    "rhythm_change_pct": 0.50,
+    "deep_bass_enabled": false,
+    "deep_bass_thresh": 0.90,
+    "decay_speed": 0.90,
+    "glow_thresh": 0.30,
+    "beat_hold_frames": 6,
+    "deep_bass_hold_frames": 6
+}

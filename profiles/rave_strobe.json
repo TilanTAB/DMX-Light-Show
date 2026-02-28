@@ -1,0 +1,69 @@
+{
+    "name": "Rave Strobe",
+    "description": "Maximum sensitivity, rapid color cycling, strobe on heavy drops. Full energy party mode.",
+    "gain_boost": 60.0,
+    "volume_gate": 0.00005,
+    "agc_thresh": 0.2,
+    "kick_thresh": 0.03,
+    "snare_thresh": 0.05,
+    "onset_cooldown": 0.08,
+    "palettes": [
+        [
+            [
+                255,
+                0,
+                0
+            ],
+            [
+                0,
+                0,
+                255
+            ]
+        ],
+        [
+            [
+                0,
+                255,
+                0
+            ],
+            [
+                255,
+                0,
+                255
+            ]
+        ],
+        [
+            [
+                255,
+                255,
+                0
+            ],
+            [
+                0,
+                255,
+                255
+            ]
+        ],
+        [
+            [
+                255,
+                0,
+                255
+            ],
+            [
+                0,
+                255,
+                0
+            ]
+        ]
+    ],
+    "color_cycle_mode": "beat",
+    "color_cycle_interval": 2.0,
+    "rhythm_change_pct": 0.20,
+    "deep_bass_enabled": true,
+    "deep_bass_thresh": 0.60,
+    "decay_speed": 0.60,
+    "glow_thresh": 0.40,
+    "beat_hold_frames": 2,
+    "deep_bass_hold_frames": 3
+}
