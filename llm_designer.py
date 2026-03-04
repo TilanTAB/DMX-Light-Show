@@ -202,10 +202,8 @@ A well-designed show follows this emotional curve:
       "master_dimmer_percent": 30,
       "fade_speed_seconds": 3.0,
       "strobe_allowed": false,
-      "strobe_speed": 0,
       "energy_level": 2,
-      "behavior": "slow_breathe",
-      "notes": "Deep ambient blue wash, gentle pulse"
+      "behavior": "slow_breathe"
     }},
     ...one cue per structural section...
   ],
@@ -235,7 +233,22 @@ Controls how aggressively the lights react to drum onsets:
 7-8: Aggressive. Every beat punches hard. (choruses)
 9-10: Maximum. Every onset triggers full flash. (drops ONLY)
 
-CRITICAL: Generate a cue for EVERY structural section from the telemetry.
+=== HARD CONSTRAINTS (NEVER VIOLATE) ===
+1. NEVER use the same behavior for two adjacent cues. Contrast is mandatory.
+2. NEVER use strobe_blast for more than 6 seconds total across the entire show.
+3. NEVER set energy_level > 7 for sections with vocal_pct > 50% (vocals need calm lighting).
+4. start_time of cue N+1 MUST EXACTLY EQUAL end_time of cue N. No gaps, no overlaps.
+5. The FIRST cue MUST start at time 0.0.
+6. The LAST cue MUST end at the song's total_duration_seconds.
+7. master_dimmer_percent for Intro/Outro sections MUST be <= 40.
+8. Use buildup_ramp at least once before the highest-energy Chorus/Drop section.
+9. Use the section "character" field from the telemetry to guide behavior selection:
+   - character="bass-heavy" → bass_white_blast or blackout_punch
+   - character="vocal-driven" → static_wash or beat_reactive (never strobe!)
+   - character="bright/atmospheric" → rainbow_sweep or slow_breathe
+   - character="rhythmic" → fast_pulse or color_chase
+
+CRITICAL: Generate EXACTLY one cue for EVERY structural section from the telemetry.
 The "phrases" array is a backward-compatibility summary."""
     
     url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
@@ -245,12 +258,29 @@ The "phrases" array is a backward-compatibility summary."""
         "api-key": api_key
     }
     
+    # B4 FIX: Stronger system message with step-by-step reasoning framework
+    system_message = """You are a professional concert lighting director who outputs ONLY valid JSON lighting plans for DMX fixtures.
+
+REASONING PROCESS (follow this order):
+1. Read the song metrics (BPM, energy, duration) to understand the overall vibe.
+2. Read the SECTION CHARACTER SUMMARY to understand each section's sonic identity.
+3. For each section, pick a behavior that matches its character AND contrasts with neighbors.
+4. Choose color palettes that tell an emotional story (warm intro → cool drop → warm outro).
+5. Set energy_level proportional to the section's relative energy and beat density.
+6. Validate: no gaps between cues, full song coverage, no adjacent duplicate behaviors.
+
+Output ONLY the JSON object. No explanation, no markdown, no comments."""
+
     payload = {
         "messages": [
-            {"role": "system", "content": "You are a professional JSON data generator for DMX lighting shows."},
+            {"role": "system", "content": system_message},
             {"role": "user", "content": prompt}
         ],
-        "response_format": {"type": "json_object"}
+        "response_format": {"type": "json_object"},
+        # B3 FIX: Control output quality and prevent truncation
+        "temperature": 0.4,       # Low = consistent, well-formed JSON structure
+        "max_tokens": 4096,       # Prevent truncated responses on long songs
+        "top_p": 0.9,             # Slight diversity in color palette choices
     }
 
     # Retry with backoff for transient failures
