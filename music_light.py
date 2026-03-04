@@ -931,13 +931,31 @@ class DMXEngine:
         current_time = time.time()
         kick_thresh = self.profile_kick_thresh if is_loopback else 0.3
         snare_thresh = self.profile_snare_thresh if is_loopback else 0.35
+        cooldown_ok = (current_time - self.last_beat_time) > self.profile_onset_cooldown
 
-        is_kick = kick_i > kick_thresh and (current_time - self.last_beat_time) > self.profile_onset_cooldown
-        is_snare = snare_i > snare_thresh and (current_time - self.last_beat_time) > self.profile_onset_cooldown
+        # VOCAL SUPPRESSION: Two gates that prevent vocals from triggering beats.
+        #
+        # Gate 1 — Kick-to-mid ratio: Real kick drums have overwhelming energy
+        # below 150Hz relative to 400-2000Hz mids. Vocals are the opposite —
+        # their fundamental (150-400Hz) and harmonics dominate the mid range.
+        # If mid_mag >= kick_mag, the energy is vocal, not percussive.
+        kick_dominates = kick_mag > (mid_mag * 1.5)  # Kick must be 1.5x louder than mids
+        #
+        # Gate 2 — Snare flux sharpness: Real snare hits create an explosive
+        # transient (huge spectral flux). Vocal consonants create gradual energy
+        # changes. We require the flux component to dominate the steady-state
+        # magnitude — if most of the energy is steady-state, it's sustained audio
+        # (vocals/instruments), not a percussive hit.
+        snare_is_transient = snare_flux > (snare_hit * 0.8) if snare_hit > 0 else snare_flux > 0
+
+        is_kick = kick_i > kick_thresh and cooldown_ok and kick_dominates
+        is_snare = snare_i > snare_thresh and cooldown_ok and snare_is_transient
 
         # Periodic diagnostic logging every 100 frames
         if is_loopback and self.frame_counter % 100 == 0:
-            logger.info(f"[DIAG] vol={volume:.4f} kick_i={kick_i:.4f} thresh={kick_thresh:.2f} is_kick={is_kick} beats={self.total_beat_count}")
+            logger.info(f"[DIAG] vol={volume:.4f} kick_i={kick_i:.4f} mid_mag={mid_mag:.4f} "
+                        f"kick_dom={kick_dominates} snare_trans={snare_is_transient} "
+                        f"is_kick={is_kick} beats={self.total_beat_count}")
 
         if is_kick or is_snare:
             self.last_beat_time = current_time
