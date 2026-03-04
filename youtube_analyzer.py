@@ -300,6 +300,38 @@ def analyze_audio_structure(filepath):
     })
     
     # ================================================================
+    # A1 FIX: Enrich sections with per-section spectral profile
+    # Without this, the LLM only sees "Chorus/Drop" + a flat energy number.
+    # With this, it knows: "this chorus is bass-heavy with 80% vocals and
+    # fast hi-hats" → enabling precise behavior selection.
+    # ================================================================
+    for sec in sections:
+        seg_start = int(sec["start"] / segment_duration)
+        seg_end = max(seg_start + 1, int(sec["end"] / segment_duration))
+        seg_slice = timeline[seg_start:seg_end]
+        if seg_slice:
+            sec["avg_sub_bass"] = round(float(np.mean([s["sub_bass"] for s in seg_slice])), 4)
+            sec["avg_bass"] = round(float(np.mean([s["bass"] for s in seg_slice])), 4)
+            sec["avg_mids"] = round(float(np.mean([s["mids"] for s in seg_slice])), 4)
+            sec["avg_highs"] = round(float(np.mean([s["highs"] for s in seg_slice])), 4)
+            sec["avg_beat_density"] = round(float(np.mean([s["beat_density"] for s in seg_slice])), 1)
+            vocal_count = sum(1 for s in seg_slice if s["vocal_present"])
+            sec["vocal_pct"] = round(vocal_count / len(seg_slice) * 100)
+            
+            # Dominant character label for quick LLM reasoning
+            total_low = sec["avg_sub_bass"] + sec["avg_bass"]
+            if total_low > sec["avg_mids"] * 2:
+                sec["character"] = "bass-heavy"
+            elif sec["vocal_pct"] > 60:
+                sec["character"] = "vocal-driven"
+            elif sec["avg_highs"] > sec["avg_mids"]:
+                sec["character"] = "bright/atmospheric"
+            elif sec["avg_beat_density"] > 6:
+                sec["character"] = "rhythmic"
+            else:
+                sec["character"] = "balanced"
+    
+    # ================================================================
     # STEP 3: Global Song Metrics
     # ================================================================
     # BPM estimation from total beat count

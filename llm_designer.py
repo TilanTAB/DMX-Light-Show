@@ -15,6 +15,68 @@ logger = logging.getLogger(__name__)
 # Load variables from .env
 load_dotenv()
 
+
+def _build_section_descriptions(sections):
+    """B1 FIX: Convert enriched section data (from A1) into natural language
+    prose that the LLM can reason about. LLMs understand language far better
+    than numeric tables — this produces dramatically better behavior assignments.
+    
+    Example output:
+      Section 1: Intro/Outro (0s-16s) — balanced, sparse beat, 0% vocals, low energy
+      Section 2: Chorus/Drop (16s-48s) — bass-heavy, fast beats, 20% vocals, HIGH energy
+    """
+    if not sections:
+        return "No sections detected."
+    
+    lines = []
+    # Find max energy for relative comparison
+    max_energy = max((s.get("avg_energy", 0.001) for s in sections), default=0.001)
+    
+    for i, sec in enumerate(sections):
+        start = sec.get("start", 0)
+        end = sec.get("end", 0)
+        sec_type = sec.get("type", "Unknown")
+        character = sec.get("character", "balanced")
+        
+        # Relative energy label
+        rel_energy = sec.get("avg_energy", 0) / max(max_energy, 0.001)
+        if rel_energy < 0.35:
+            energy_label = "very low energy"
+        elif rel_energy < 0.6:
+            energy_label = "low-medium energy"
+        elif rel_energy < 0.85:
+            energy_label = "medium-high energy"
+        else:
+            energy_label = "HIGH energy"
+        
+        # Beat density description
+        beat_d = sec.get("avg_beat_density", 0)
+        if beat_d < 2:
+            beat_label = "sparse/no clear beat"
+        elif beat_d < 5:
+            beat_label = "steady beat"
+        elif beat_d < 8:
+            beat_label = "fast beats"
+        else:
+            beat_label = "very fast/dense beats"
+        
+        # Vocal description
+        vocal_pct = sec.get("vocal_pct", 0)
+        if vocal_pct > 70:
+            vocal_label = f"strong vocals ({vocal_pct}%)"
+        elif vocal_pct > 30:
+            vocal_label = f"some vocals ({vocal_pct}%)"
+        else:
+            vocal_label = f"instrumental ({vocal_pct}% vocal)"
+        
+        duration = round(end - start, 1)
+        lines.append(
+            f"  Section {i+1}: {sec_type} ({start:.0f}s-{end:.0f}s, {duration}s long) "
+            f"— {character}, {beat_label}, {vocal_label}, {energy_label}"
+        )
+    
+    return "\n".join(lines)
+
 def get_gpt_lighting_plan(audio_features):
     """
     Sends LIVE rhythm telemetry (BPM, bass density, energy) to GPT-5 Nano 
@@ -31,16 +93,18 @@ def get_gpt_lighting_plan(audio_features):
 
     print(f"\n[+] Sending Rhythm Telemetry to Azure GPT-5 Nano...")
 
-    # Trim the spectral timeline to avoid exceeding token limits
-    # Send every 3rd data point (6-second resolution) instead of every 2s
-    trimmed_timeline = audio_features.get("spectral_timeline", [])[::3]
-    
-    # Build a compact telemetry payload for the LLM
+    # B1 FIX: Replace raw spectral timeline (40 rows of numbers, ~2000 tokens)
+    # with prose summaries the LLM can actually reason about (~300 tokens).
+    # LLMs are terrible at numerical table reasoning but excellent at prose.
+    sections = audio_features.get("structural_sections", [])
+    section_descriptions = _build_section_descriptions(sections)
+
+    # Build a compact telemetry payload — now with enriched sections (A1)
+    # and no raw timeline (B1). Saves ~1700 tokens per request.
     compact_telemetry = {
         "song_metrics": audio_features.get("song_metrics", {}),
-        "structural_sections": audio_features.get("structural_sections", []),
+        "structural_sections": sections,
         "events": audio_features.get("events", {}),
-        "spectral_samples": trimmed_timeline[:40],  # Cap at 40 data points
     }
 
     prompt = f"""You are an elite professional concert lighting director with 20+ years of experience 
@@ -48,6 +112,9 @@ designing DMX shows for festivals like Tomorrowland, Ultra, and Coachella.
 
 === AUDIO TELEMETRY ===
 {json.dumps(compact_telemetry, indent=2)}
+
+=== SECTION CHARACTER SUMMARY ===
+{section_descriptions}
 
 === YOUR TASK ===
 Analyze the ENTIRE song structure first. Identify the emotional arc: 
