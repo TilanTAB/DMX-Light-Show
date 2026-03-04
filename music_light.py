@@ -87,6 +87,25 @@ def lerp_color(c1, c2, t):
     )
 
 
+# S2: Gamma correction — LEDs are non-linear. The jump from 0→50 is barely visible,
+# while 200→255 is dramatic. A gamma curve (γ≈2.2) makes fades look smooth and
+# breathing effects feel natural instead of jerky. Industry standard on all
+# professional Martin/Chauvet/ETC fixtures.
+GAMMA_LUT = np.array([int(((i / 255.0) ** 2.2) * 255) for i in range(256)], dtype=np.uint8)
+
+def gamma_correct(value):
+    """Apply perceptual gamma curve so dimming feels linear to human eyes."""
+    return int(GAMMA_LUT[max(0, min(255, int(value)))])
+
+
+# S1: Bloom attack — instead of hard-snapping to 255, converge in 1-2 frames
+# (~20-40ms). Creates a subtle "bloom" effect that looks organic, like a real
+# stage light filament heating up, vs a digital switch being flipped.
+def bloom_attack(current, target, speed=0.85):
+    """Fast EMA attack for organic bloom on beat hits. speed=0.85 ≈ 2-frame rise."""
+    return current + speed * (target - current)
+
+
 # ============================================================
 # DMX ENGINE — All mutable state lives here (I1 FIX)
 # ============================================================
@@ -266,7 +285,17 @@ class DMXEngine:
                 logger.error(f"[DMX WORKER] Error: {ex}")
 
     def send_dmx(self, master, red, green, blue, white=0, strobe=0):
-        data = [int(max(0, min(255, v))) for v in [master, red, green, blue, white, strobe, 0, 0]]
+        # S2: Apply gamma correction to color channels for perceptually linear fading.
+        # Master/strobe stay linear (they're intensity controls, not color output).
+        data = [
+            int(max(0, min(255, master))),     # CH1: Master dimmer (linear)
+            gamma_correct(red),                 # CH2: Red (gamma corrected)
+            gamma_correct(green),               # CH3: Green (gamma corrected)
+            gamma_correct(blue),                # CH4: Blue (gamma corrected)
+            gamma_correct(white),               # CH5: White (gamma corrected)
+            int(max(0, min(255, strobe))),      # CH6: Strobe (linear)
+            0, 0                                # CH7-8: Unused
+        ]
         try:
             # Pipelined async send. If the physical USB stick falls >40ms behind, 
             # we forcibly yank the old pending visual frame and insert the fresh one.
@@ -568,6 +597,19 @@ class DMXEngine:
         tg = min(255.0, kick_color[1] * k + accent_color[1] * s + accent_color[1] * mid_i * 0.15)
         tb = min(255.0, kick_color[2] * k + accent_color[2] * s + accent_color[2] * mid_i * 0.15)
 
+        # S6: Color temperature shift based on energy state.
+        # Calm sections → warm shift (amber/pink ~2700K feel)
+        # High energy → cool shift (blue/violet ~6500K feel)
+        # This is how professional LDs create emotional narrative through color alone.
+        if self.energy_state == "calm":
+            tr = min(255.0, tr * 1.1)   # Boost red warmth
+            tg *= 0.85                   # Reduce green
+            tb *= 0.6                    # Strongly reduce blue → warm amber
+        elif self.energy_state == "high":
+            tr *= 0.7                    # Reduce red warmth
+            tg *= 0.9                    # Slightly reduce green
+            tb = min(255.0, tb * 1.15)  # Boost blue → cool epic feel
+
         # Apply ambient floor — lights always glow when music plays
         if ambient_floor > 0:
             tr = max(tr, kick_color[0] * ambient_floor)
@@ -646,31 +688,48 @@ class DMXEngine:
 
         is_deep_bass = self.profile_deep_bass_enabled and self.peak_kick > 0.00001 and (kick_mag / self.peak_kick) > self.profile_deep_bass_thresh
 
+        # S4: Velocity-sensitive brightness — soft beats get dim, hard beats get blast.
+        # kick_i ranges 0.0→1.0. We map it to a 0.5→1.0 brightness multiplier so
+        # even soft ghost notes produce visible (but dim) flashes.
+        kick_velocity = min(1.0, kick_i / max(self.profile_kick_thresh, 0.01))
+        snare_velocity = min(1.0, snare_i / max(self.profile_snare_thresh, 0.01))
+        beat_velocity = max(kick_velocity, snare_velocity)
+        # Map to 120-255 range: soft = 120, hard = 255
+        velocity_brightness = 120.0 + (135.0 * beat_velocity)
+
         # ── DEEP BASS COMBO: Dual-color blast ──
         if (is_kick or is_snare) and is_deep_bass:
-            # Combos cycle: R+B (purple), R+G (yellow), B+G (cyan), R+G+B (white)
             combo = color_idx % 4
             if combo == 0:
-                self.out_r = 255.0; self.out_b = 200.0; self.out_g = 0  # Purple
+                tr, tg, tb = 255.0, 0, 200.0       # Purple
             elif combo == 1:
-                self.out_r = 255.0; self.out_g = 200.0; self.out_b = 0  # Yellow
+                tr, tg, tb = 255.0, 200.0, 0        # Yellow
             elif combo == 2:
-                self.out_b = 255.0; self.out_g = 200.0; self.out_r = 0  # Cyan
+                tr, tg, tb = 0, 200.0, 255.0         # Cyan
             else:
-                self.out_r = 200.0; self.out_g = 200.0; self.out_b = 200.0  # White
-            self.out_w = 255.0
-            self.out_master = 255.0
+                tr, tg, tb = 200.0, 200.0, 200.0     # White
+            # S1: Bloom attack — converge over 1-2 frames instead of instant snap
+            self.out_r = bloom_attack(self.out_r, tr)
+            self.out_g = bloom_attack(self.out_g, tg)
+            self.out_b = bloom_attack(self.out_b, tb)
+            self.out_w = bloom_attack(self.out_w, 255.0)
+            self.out_master = velocity_brightness  # S4: Velocity-sensitive
             self.out_strobe = 0
-            self.beat_hold_frames = self.profile_deep_bass_hold  # Extra hold for big hits
+            self.beat_hold_frames = self.profile_deep_bass_hold
             return
 
         # ── NORMAL BEAT: Single color blast ──
         if is_kick or is_snare:
-            self.out_r = 255.0 if color_idx == 0 else 0
-            self.out_g = 255.0 if color_idx == 2 else 0
-            self.out_b = 255.0 if color_idx == 1 else 0
-            self.out_w = 255.0 if color_idx == 3 else 0
-            self.out_master = 255.0
+            tr = 255.0 if color_idx == 0 else 0
+            tg = 255.0 if color_idx == 2 else 0
+            tb = 255.0 if color_idx == 1 else 0
+            tw = 255.0 if color_idx == 3 else 0
+            # S1: Bloom attack — organic rise instead of digital snap
+            self.out_r = bloom_attack(self.out_r, tr)
+            self.out_g = bloom_attack(self.out_g, tg)
+            self.out_b = bloom_attack(self.out_b, tb)
+            self.out_w = bloom_attack(self.out_w, tw)
+            self.out_master = velocity_brightness  # S4: Velocity-sensitive
             self.out_strobe = 0
             self.beat_hold_frames = self.profile_beat_hold
             return
@@ -678,12 +737,19 @@ class DMXEngine:
         # ── HOLD after beat ──
         if self.beat_hold_frames > 0:
             self.beat_hold_frames -= 1
-            self.out_w = self.out_w * 0.85
-            self.out_master = 255.0
+            # S3: Warm afterglow — white fades faster than color, creating an
+            # "ember cooling" effect. Green fades slightly faster than red,
+            # shifting the afterglow warm (amber) as it dies. This is exactly how
+            # professional stage lights with halogen falloff look.
+            self.out_w *= 0.80
+            self.out_r *= 0.95     # Red persists longest (warm)
+            self.out_g *= 0.88     # Green fades medium
+            self.out_b *= 0.82     # Blue fades fastest (cool dies first)
+            self.out_master = max(self.out_master * 0.92, 60.0)
             self.out_strobe = 0
             return
 
-        # ── BETWEEN BEATS: Subtle glow ──
+        # ── BETWEEN BEATS: Subtle glow + breathing white ──
         bass_active = bass > self.profile_glow_thresh
 
         if bass_active:
@@ -694,11 +760,21 @@ class DMXEngine:
             self.out_w = 255.0 * glow if color_idx == 3 else 0
             self.out_master = max(15, glow * 180)
         else:
-            self.out_r *= self.profile_decay_speed
-            self.out_g *= self.profile_decay_speed
-            self.out_b *= self.profile_decay_speed
-            self.out_w *= self.profile_decay_speed
-            self.out_master *= self.profile_decay_speed
+            # S3: Warm afterglow tail — color channels decay at different rates
+            # so the light shifts warm amber as it fades out, like a cooling ember.
+            decay = self.profile_decay_speed
+            self.out_r *= decay * 1.05   # Red lingers longest
+            self.out_g *= decay * 0.95   # Green decays normally
+            self.out_b *= decay * 0.85   # Blue vanishes first
+            self.out_w *= decay
+            self.out_master *= decay
+
+        # S5: Breathing white floor — a subtle sine-wave pulse on the white LED
+        # synced to overall volume prevents the room from ever feeling "dead"
+        # between beats, while still maintaining dramatic impact on bass hits.
+        breath = math.sin(t * math.pi * 2.0) * 0.5 + 0.5  # 0.0→1.0 sine at ~1Hz
+        white_floor = volume * 800 * breath * 0.12  # Max ~12% brightness
+        self.out_w = max(self.out_w, min(30.0, white_floor))
 
         self.out_strobe = 0
 

@@ -1,0 +1,93 @@
+{
+    "name": "Festival Main Stage",
+    "description": "Tomorrowland-inspired. High contrast blackouts, massive white bass hits, warm breakdowns, curated palettes from professional concert LDs. Best for EDM, house, and festival music.",
+    "gain_boost": 45.0,
+    "volume_gate": 0.00005,
+    "agc_thresh": 0.35,
+    "kick_thresh": 0.06,
+    "snare_thresh": 0.09,
+    "onset_cooldown": 0.10,
+    "palettes": [
+        [
+            [
+                10,
+                30,
+                180
+            ],
+            [
+                255,
+                100,
+                20
+            ]
+        ],
+        [
+            [
+                130,
+                0,
+                255
+            ],
+            [
+                0,
+                220,
+                255
+            ]
+        ],
+        [
+            [
+                255,
+                0,
+                120
+            ],
+            [
+                0,
+                255,
+                80
+            ]
+        ],
+        [
+            [
+                255,
+                180,
+                0
+            ],
+            [
+                0,
+                80,
+                255
+            ]
+        ],
+        [
+            [
+                0,
+                255,
+                200
+            ],
+            [
+                200,
+                0,
+                255
+            ]
+        ],
+        [
+            [
+                255,
+                50,
+                50
+            ],
+            [
+                50,
+                200,
+                255
+            ]
+        ]
+    ],
+    "color_cycle_mode": "rhythm",
+    "color_cycle_interval": 6.0,
+    "rhythm_change_pct": 0.25,
+    "deep_bass_enabled": true,
+    "deep_bass_thresh": 0.75,
+    "decay_speed": 0.70,
+    "glow_thresh": 0.45,
+    "beat_hold_frames": 3,
+    "deep_bass_hold_frames": 5
+}
