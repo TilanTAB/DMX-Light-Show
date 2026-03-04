@@ -23,7 +23,10 @@ logger = logging.getLogger(__name__)
 # CONSTANTS (immutable — safe at module level)
 # ==========================================
 SAMPLE_RATE = 44100
-BLOCK_SIZE = 1024
+# SYNC FIX: Reduced from 1024→512 to cut inherent audio delay from 21ms→10.7ms.
+# At 48kHz WASAPI, 512 samples = 10.7ms per callback.
+# Tradeoff: lowest FFT frequency resolution is 48000/512 = 93.75Hz (still covers kick range 30-150Hz).
+BLOCK_SIZE = 512
 MIN_VOLUME_GATE = 0.001
 
 # Frequency bands
@@ -168,6 +171,10 @@ class DMXEngine:
         self.peak_kick = 0.0
         self.peak_snare = 0.0
         self.peak_mid = 0.0
+
+        # SYNC FIX: Pre-cached Hanning windows keyed by block size.
+        # Avoids creating a new numpy array (~512-1024 floats) every frame.
+        self._hanning_cache = {}
         self.peak_hihat = 0.0
         self.last_palette_rotate = 0.0
         self.beat_hold_frames = 0  # Hold full brightness for N frames after beat
@@ -689,63 +696,54 @@ class DMXEngine:
         is_deep_bass = self.profile_deep_bass_enabled and self.peak_kick > 0.00001 and (kick_mag / self.peak_kick) > self.profile_deep_bass_thresh
 
         # S4: Velocity-sensitive brightness — soft beats get dim, hard beats get blast.
-        # kick_i ranges 0.0→1.0. We map it to a 0.5→1.0 brightness multiplier so
-        # even soft ghost notes produce visible (but dim) flashes.
         kick_velocity = min(1.0, kick_i / max(self.profile_kick_thresh, 0.01))
         snare_velocity = min(1.0, snare_i / max(self.profile_snare_thresh, 0.01))
         beat_velocity = max(kick_velocity, snare_velocity)
-        # Map to 120-255 range: soft = 120, hard = 255
         velocity_brightness = 120.0 + (135.0 * beat_velocity)
 
         # ── DEEP BASS COMBO: Dual-color blast ──
+        # SYNC FIX: Instant snap (not bloom) on beat onset. Bloom was adding 20-40ms
+        # visual delay that made lights feel "late." Beat onset MUST be instant to
+        # synchronize with the audio transient the ear just heard.
         if (is_kick or is_snare) and is_deep_bass:
             combo = color_idx % 4
             if combo == 0:
-                tr, tg, tb = 255.0, 0, 200.0       # Purple
+                self.out_r, self.out_g, self.out_b = 255.0, 0, 200.0
             elif combo == 1:
-                tr, tg, tb = 255.0, 200.0, 0        # Yellow
+                self.out_r, self.out_g, self.out_b = 255.0, 200.0, 0
             elif combo == 2:
-                tr, tg, tb = 0, 200.0, 255.0         # Cyan
+                self.out_r, self.out_g, self.out_b = 0, 200.0, 255.0
             else:
-                tr, tg, tb = 200.0, 200.0, 200.0     # White
-            # S1: Bloom attack — converge over 1-2 frames instead of instant snap
-            self.out_r = bloom_attack(self.out_r, tr)
-            self.out_g = bloom_attack(self.out_g, tg)
-            self.out_b = bloom_attack(self.out_b, tb)
-            self.out_w = bloom_attack(self.out_w, 255.0)
-            self.out_master = velocity_brightness  # S4: Velocity-sensitive
+                self.out_r, self.out_g, self.out_b = 200.0, 200.0, 200.0
+            self.out_w = 255.0
+            self.out_master = velocity_brightness
             self.out_strobe = 0
             self.beat_hold_frames = self.profile_deep_bass_hold
             return
 
-        # ── NORMAL BEAT: Single color blast ──
+        # ── NORMAL BEAT: Instant color snap ──
         if is_kick or is_snare:
-            tr = 255.0 if color_idx == 0 else 0
-            tg = 255.0 if color_idx == 2 else 0
-            tb = 255.0 if color_idx == 1 else 0
-            tw = 255.0 if color_idx == 3 else 0
-            # S1: Bloom attack — organic rise instead of digital snap
-            self.out_r = bloom_attack(self.out_r, tr)
-            self.out_g = bloom_attack(self.out_g, tg)
-            self.out_b = bloom_attack(self.out_b, tb)
-            self.out_w = bloom_attack(self.out_w, tw)
-            self.out_master = velocity_brightness  # S4: Velocity-sensitive
+            self.out_r = 255.0 if color_idx == 0 else 0
+            self.out_g = 255.0 if color_idx == 2 else 0
+            self.out_b = 255.0 if color_idx == 1 else 0
+            self.out_w = 255.0 if color_idx == 3 else 0
+            self.out_master = velocity_brightness
             self.out_strobe = 0
             self.beat_hold_frames = self.profile_beat_hold
             return
 
         # ── HOLD after beat ──
+        # SYNC FIX: Master stays at full during hold so the flash feels crisp.
+        # Previously master was decaying to 60 during hold, making flashes feel mushy.
+        # S3 afterglow applies only to color channels, not master brightness.
         if self.beat_hold_frames > 0:
             self.beat_hold_frames -= 1
-            # S3: Warm afterglow — white fades faster than color, creating an
-            # "ember cooling" effect. Green fades slightly faster than red,
-            # shifting the afterglow warm (amber) as it dies. This is exactly how
-            # professional stage lights with halogen falloff look.
+            # S3: Warm afterglow — colors shift warm as they decay
             self.out_w *= 0.80
-            self.out_r *= 0.95     # Red persists longest (warm)
-            self.out_g *= 0.88     # Green fades medium
-            self.out_b *= 0.82     # Blue fades fastest (cool dies first)
-            self.out_master = max(self.out_master * 0.92, 60.0)
+            self.out_r *= 0.95
+            self.out_g *= 0.88
+            self.out_b *= 0.82
+            self.out_master = max(self.out_master, 200.0)  # Stay bright during hold
             self.out_strobe = 0
             return
 
@@ -760,20 +758,17 @@ class DMXEngine:
             self.out_w = 255.0 * glow if color_idx == 3 else 0
             self.out_master = max(15, glow * 180)
         else:
-            # S3: Warm afterglow tail — color channels decay at different rates
-            # so the light shifts warm amber as it fades out, like a cooling ember.
+            # S3: Warm afterglow tail
             decay = self.profile_decay_speed
-            self.out_r *= decay * 1.05   # Red lingers longest
-            self.out_g *= decay * 0.95   # Green decays normally
-            self.out_b *= decay * 0.85   # Blue vanishes first
+            self.out_r *= decay * 1.05
+            self.out_g *= decay * 0.95
+            self.out_b *= decay * 0.85
             self.out_w *= decay
             self.out_master *= decay
 
-        # S5: Breathing white floor — a subtle sine-wave pulse on the white LED
-        # synced to overall volume prevents the room from ever feeling "dead"
-        # between beats, while still maintaining dramatic impact on bass hits.
-        breath = math.sin(t * math.pi * 2.0) * 0.5 + 0.5  # 0.0→1.0 sine at ~1Hz
-        white_floor = volume * 800 * breath * 0.12  # Max ~12% brightness
+        # S5: Breathing white floor — subtle sine-wave prevents dead room
+        breath = math.sin(t * math.pi * 2.0) * 0.5 + 0.5
+        white_floor = volume * 800 * breath * 0.12
         self.out_w = max(self.out_w, min(30.0, white_floor))
 
         self.out_strobe = 0
@@ -888,13 +883,11 @@ class DMXEngine:
         if N == 0:
             return
 
-        # L1 FIX: Apply a Hanning window before FFT to prevent "spectral leakage."
-        # Without this, a loud vocal at 400Hz generates phantom energy at 80Hz,
-        # tricking the beat detector into thinking a kick drum is playing.
-        # The Hanning curve smoothly fades each chunk's edges to zero,
-        # keeping each frequency band mathematically isolated.
-        window = np.hanning(N)
-        windowed = mono * window
+        # L1 FIX: Apply a Hanning window before FFT to prevent spectral leakage.
+        # SYNC FIX: Cache the window array to avoid creating a new one every frame.
+        if N not in self._hanning_cache:
+            self._hanning_cache[N] = np.hanning(N)
+        windowed = mono * self._hanning_cache[N]
 
         yf = np.fft.rfft(windowed)
         # Multiply by 2.0 to compensate for the Hanning window's 50% amplitude
