@@ -81,6 +81,7 @@ _generation_status = {"active": False, "message": "", "progress": 0}
 
 # I6 FIX: In-memory index of video_id → show_id (built on startup, updated on add/delete)
 _video_index: dict[str, str] = {}
+_video_index_lock = threading.Lock()  # C4 FIX: Protect compound read-modify-delete on _video_index
 
 
 # ==========================================
@@ -204,9 +205,10 @@ def _save_show_to_library(show_json_path: str, name: str | None = None) -> str:
     with open(show_file, 'w') as f:
         json.dump(data, f, indent=2)
 
-    # I6 FIX: Update in-memory index
+    # I6 FIX: Update in-memory index (C4 FIX: thread-safe)
     if video_id:
-        _video_index[video_id] = show_id
+        with _video_index_lock:
+            _video_index[video_id] = show_id
 
     return show_id
 
@@ -243,22 +245,23 @@ def _resolve_show_path(show_id: str) -> str:
 
 def _build_video_index():
     """I6 FIX: Build in-memory video_id → show_id index on startup."""
-    _video_index.clear()
-    if not os.path.exists(SHOWS_DIR):
-        return
-    for folder in os.listdir(SHOWS_DIR):
-        show_file = os.path.join(SHOWS_DIR, folder, "show.json")
-        if not os.path.isfile(show_file):
-            continue
-        try:
-            with open(show_file, 'r') as fh:
-                data = json.load(fh)
-            vid = data.get("metadata", {}).get("video_id")
-            if vid:
-                _video_index[vid] = folder
-        except Exception:
-            pass
-    logger.info(f"Video index built: {len(_video_index)} entries")
+    with _video_index_lock:
+        _video_index.clear()
+        if not os.path.exists(SHOWS_DIR):
+            return
+        for folder in os.listdir(SHOWS_DIR):
+            show_file = os.path.join(SHOWS_DIR, folder, "show.json")
+            if not os.path.isfile(show_file):
+                continue
+            try:
+                with open(show_file, 'r') as fh:
+                    data = json.load(fh)
+                vid = data.get("metadata", {}).get("video_id")
+                if vid:
+                    _video_index[vid] = folder
+            except Exception:
+                pass
+        logger.info(f"Video index built: {len(_video_index)} entries")
 
 
 def _find_existing_show_by_audio(url: str) -> dict | None:
@@ -270,9 +273,10 @@ def _find_existing_show_by_audio(url: str) -> dict | None:
     if not video_id:
         return None
     
-    # O(1) lookup from in-memory index
-    if video_id in _video_index:
-        folder = _video_index[video_id]
+    # O(1) lookup from in-memory index (C4 FIX: thread-safe)
+    with _video_index_lock:
+        folder = _video_index.get(video_id)
+    if folder:
         show_file = os.path.join(SHOWS_DIR, folder, "show.json")
         if os.path.isfile(show_file):
             try:
@@ -459,9 +463,13 @@ def generate_show(req: GenerateRequest):
                     return
         
         try:
+            # M4 FIX: Merge stderr into stdout to prevent pipe buffer deadlock.
+            # Previously stderr was piped separately but only read AFTER the process
+            # exits. If ffmpeg/yt-dlp writes >64KB to stderr, the pipe fills and
+            # the subprocess hangs indefinitely.
             proc = subprocess.Popen(
                 cmd, cwd=BASE_DIR,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1
             )
             
@@ -526,12 +534,11 @@ def generate_show(req: GenerateRequest):
                     
             proc.wait(timeout=30)  # stdout already closed, so this is just cleanup
             
-            stderr = proc.stderr.read() if proc.stderr else ""
-            if stderr:
-                logger.warning(f"stderr output: {stderr[-500:]}")
+            # M4 FIX: stderr is now merged into stdout, so no separate read needed.
+            # Error messages from ffmpeg/yt-dlp are captured in all_output above.
             
             if proc.returncode != 0:
-                error_msg = stderr[-300:] if stderr else (all_output[-1] if all_output else "Unknown error")
+                error_msg = all_output[-1] if all_output else "Unknown error"
                 logger.error(f"youtube_analyzer.py exited with code {proc.returncode}: {error_msg}")
                 with _generation_lock:
                     _generation_status = {"active": False, "message": f"Error: {error_msg}", "progress": 0}
@@ -714,9 +721,13 @@ def playback_status():
         except Exception:
             pass
 
+    # C5 FIX: Acquire lock before reading _generation_status (was unprotected)
+    with _generation_lock:
+        gen_status_copy = dict(_generation_status)
+
     return {
         "playing": is_playing,
-        "generation": _generation_status,
+        "generation": gen_status_copy,
         "playback": position_data,
     }
 
@@ -728,11 +739,12 @@ def delete_show(show_id: str):
     if not os.path.isdir(show_dir):
         raise HTTPException(404, "Show not found.")
 
-    # I6 FIX: Remove from index
-    for vid, sid in list(_video_index.items()):
-        if sid == show_id:
-            del _video_index[vid]
-            break
+    # I6 FIX: Remove from index (C4 FIX: thread-safe)
+    with _video_index_lock:
+        for vid, sid in list(_video_index.items()):
+            if sid == show_id:
+                del _video_index[vid]
+                break
 
     shutil.rmtree(show_dir)
     return {"message": f"Show '{show_id}' deleted."}

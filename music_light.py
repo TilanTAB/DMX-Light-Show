@@ -127,7 +127,9 @@ class DMXEngine:
         self.prev_hihat_mag = 0.0
 
         # Beat tracking
-        self.beat_timestamps = []
+        # M2 FIX: Use deque instead of list to avoid creating a new list every frame
+        # maxlen=150 covers ~3 seconds at max 50 beats/sec
+        self.beat_timestamps = deque(maxlen=150)
         self.total_beat_count = 0
         self.last_beat_time = 0.0
         self.frame_counter = 0
@@ -879,7 +881,10 @@ class DMXEngine:
                 if self.total_beat_count % rotation_interval == 0:
                     self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
 
-        self.beat_timestamps = [t for t in self.beat_timestamps if current_time - t < 3.0]
+        # M2 FIX: Evict old timestamps in-place with O(1) popleft instead of
+        # creating a new list every frame (was generating ~47 throwaway lists/sec)
+        while self.beat_timestamps and (current_time - self.beat_timestamps[0]) > 3.0:
+            self.beat_timestamps.popleft()
         beats_per_sec = len(self.beat_timestamps) / 3.0
 
         # --- Dispatch ---
