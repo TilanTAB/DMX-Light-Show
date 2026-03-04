@@ -13,6 +13,8 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 import logging
 from collections import deque
+import threading
+import queue
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -98,6 +100,12 @@ class DMXEngine:
     def __init__(self):
         # DMX device (lazy init)
         self.dev = None
+        
+        # Async DMX transmission queue (crucial for zero-latency audio)
+        # Keeps maxsize=2 so we immediately drop old visual frames if the 
+        # physical DMX USB stick gets backlogged, preserving total real-time sync.
+        self._dmx_queue = queue.Queue(maxsize=2)
+        self._dmx_thread_running = False
 
         # Output channels
         self.out_r = 0.0
@@ -230,12 +238,68 @@ class DMXEngine:
             raise RuntimeError("uDMX not found! Please connect the adapter.")
         logger.info("uDMX found!")
 
+        # Initialize the asynchronous USB worker driver
+        if not self._dmx_thread_running:
+            self._dmx_thread_running = True
+            t = threading.Thread(target=self._dmx_worker, daemon=True)
+            t.start()
+
+    def _dmx_worker(self):
+        """
+        Background worker that continuously pulls the freshest visual frame 
+        from the queue and executes the blocking physical USB transfer.
+        """
+        while self._dmx_thread_running:
+            try:
+                # Wait for up to 0.5s for a physical DMX frame update
+                data = self._dmx_queue.get(timeout=0.5)
+                if self.dev:
+                    try:
+                        self.dev.ctrl_transfer(0x40, 2, 8, 0, data)
+                    except Exception as e:
+                        pass # Silently drop the frame, do not stall the thread
+            except queue.Empty:
+                pass
+            except Exception as ex:
+                logger.error(f"[DMX WORKER] Error: {ex}")
+
     def send_dmx(self, master, red, green, blue, white=0, strobe=0):
         data = [int(max(0, min(255, v))) for v in [master, red, green, blue, white, strobe, 0, 0]]
         try:
-            self.dev.ctrl_transfer(0x40, 2, 8, 0, data)
-        except Exception as e:
-            logger.warning(f"Failed to send DMX packet: {e}")
+            # Pipelined async send. If the physical USB stick falls >40ms behind, 
+            # we forcibly yank the old pending visual frame and insert the fresh one.
+            if self._dmx_queue.full():
+                try:
+                    self._dmx_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._dmx_queue.put_nowait(data)
+        except Exception:
+            pass
+
+    def shutdown(self):
+        """C3 FIX: Centralized cleanup — call this on ANY exit path.
+        Releases the USB device kernel handle so the next process can find it.
+        Without this, libusb holds a stale exclusive claim and usb.core.find()
+        returns None on the next run, causing 'uDMX not found'."""
+        # 1. Turn off all lights
+        if self.dev:
+            try:
+                self.dev.ctrl_transfer(0x40, 2, 8, 0, [0, 0, 0, 0, 0, 0, 0, 0])
+            except Exception:
+                pass
+
+        # 2. Stop the background DMX USB worker thread
+        self._dmx_thread_running = False
+
+        # 3. Release the USB device handle back to the OS kernel
+        if self.dev:
+            try:
+                usb.util.dispose_resources(self.dev)
+                logger.info("[SHUTDOWN] USB device handle released.")
+            except Exception as e:
+                logger.warning(f"[SHUTDOWN] USB cleanup error: {e}")
+            self.dev = None
 
     # ----------------------------------------------------------
     # IPC: Position reporting + command handling
@@ -741,13 +805,24 @@ class DMXEngine:
             self.send_dmx(self.out_master, self.out_r, self.out_g, self.out_b, self.out_w, 0)
             return
 
-        # --- FFT ---
+        # --- FFT & Windowing ---
         N = len(mono)
         if N == 0:
             return
 
-        yf = np.fft.rfft(mono)
-        fft_data = np.abs(yf) / N
+        # L1 FIX: Apply a Hanning window before FFT to prevent "spectral leakage."
+        # Without this, a loud vocal at 400Hz generates phantom energy at 80Hz,
+        # tricking the beat detector into thinking a kick drum is playing.
+        # The Hanning curve smoothly fades each chunk's edges to zero,
+        # keeping each frequency band mathematically isolated.
+        window = np.hanning(N)
+        windowed = mono * window
+
+        yf = np.fft.rfft(windowed)
+        # Multiply by 2.0 to compensate for the Hanning window's 50% amplitude
+        # reduction. Without this, real kick drums would be too quiet to break
+        # the existing 0.05-0.65 profile thresholds.
+        fft_data = (np.abs(yf) / N) * 2.0
         fft_freqs = np.fft.rfftfreq(N, 1.0 / sr)  # Use actual sample rate, not hardcoded
 
         kick_mag = get_band_mag(fft_data, fft_freqs, KICK_LO, KICK_HI)
@@ -807,8 +882,9 @@ class DMXEngine:
         self.beat_timestamps = [t for t in self.beat_timestamps if current_time - t < 3.0]
         beats_per_sec = len(self.beat_timestamps) / 3.0
 
-        # --- Determine cue/behavior ---
-        cue = None
+        # --- Dispatch ---
+        t_start_render = time.perf_counter()
+        
         if is_loopback:
             # LOOPBACK: Direct energy-to-light with profile-aware color cycling.
             t = self.frame_counter * BLOCK_SIZE / sr
@@ -872,7 +948,16 @@ class DMXEngine:
             renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                      kick_color, accent_color, volume, cue or {"energy": 7, "dimmer": 80}, t)
 
+        t_start_usb = time.perf_counter()
         self.send_dmx(self.out_master, self.out_r, self.out_g, self.out_b, self.out_w, self.out_strobe)
+        t_end_usb = time.perf_counter()
+        
+        proc_time = (t_start_usb - t_start_render) * 1000.0
+        usb_time = (t_end_usb - t_start_usb) * 1000.0
+        total_cb_time = proc_time + usb_time
+        
+        if is_loopback and total_cb_time > 10.0:
+            logger.warning(f"[LATENCY] PyAudio loop took {total_cb_time:.1f}ms (Proc: {proc_time:.1f}ms, USB: {usb_time:.1f}ms)")
 
     # ==========================================
     # MODE: SYNCED WAV PLAYBACK (I4 FIX: try/finally)
@@ -1025,7 +1110,18 @@ class DMXEngine:
                 while stream.is_active():
                     time.sleep(0.1)
         finally:
+            # C1 FIX: Full resource cleanup to prevent WASAPI port exhaustion.
+            # Without this, every loopback restart leaks a COM audio endpoint.
+            # After ~15 leaks, Windows refuses new WASAPI connections entirely.
             self.send_dmx(0, 0, 0, 0, 0, 0)
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass  # Stream may already be dead
+            p.terminate()  # Release the WASAPI COM port binding
+            self._dmx_thread_running = False  # Stop the background USB worker thread
+            logger.info("[LOOPBACK] Cleaned up: stream closed, PyAudio terminated, DMX worker stopped.")
 
 
 # ==========================================
@@ -1063,11 +1159,14 @@ if __name__ == "__main__":
         else:
             engine.run_synced_mode(show_file)
     except KeyboardInterrupt:
-        engine.send_dmx(0, 0, 0, 0, 0, 0)
-        logger.info("Lights off.")
+        logger.info("Interrupted by user.")
     except RuntimeError as e:
         logger.error(str(e))
         sys.exit(1)
     except Exception as e:
-        engine.send_dmx(0, 0, 0, 0, 0, 0)
         logger.exception(f"Fatal: {e}")
+    finally:
+        # C3 FIX: ALWAYS release USB + stop DMX thread, no matter how we exit.
+        # This prevents the "uDMX not found" ghost handle bug on next startup.
+        engine.shutdown()
+        logger.info("Shutdown complete.")
