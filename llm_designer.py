@@ -380,6 +380,9 @@ def _validate_and_repair_plan(plan):
         cue.setdefault("end_time", cue["start_time"] + 10)
         cue.setdefault("energy_level", 5)
         cue.setdefault("master_dimmer_percent", 80)
+        # P2-2 FIX: Clamp to valid ranges — LLM might return energy_level: 50
+        cue["energy_level"] = max(1, min(10, int(cue["energy_level"])))
+        cue["master_dimmer_percent"] = max(0, min(100, int(cue["master_dimmer_percent"])))
         cue.setdefault("strobe_allowed", False)
         cue.setdefault("fade_speed_seconds", 1.0)
         cue.setdefault("section_name", f"Section {i+1}")

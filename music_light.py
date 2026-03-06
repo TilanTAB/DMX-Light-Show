@@ -101,11 +101,11 @@ def gamma_correct(value):
     return int(GAMMA_LUT[max(0, min(255, int(value)))])
 
 
-# S1: Bloom attack — instead of hard-snapping to 255, converge in 1-2 frames
-# (~20-40ms). Creates a subtle "bloom" effect that looks organic, like a real
-# stage light filament heating up, vs a digital switch being flipped.
+# P0-3: bloom_attack is currently unused after the sync fix removed it from
+# beat onset paths. Kept as a utility for future smooth-transition effects
+# (e.g., slow color crossfades, ambient glow ramps).
 def bloom_attack(current, target, speed=0.85):
-    """Fast EMA attack for organic bloom on beat hits. speed=0.85 ≈ 2-frame rise."""
+    """Fast EMA attack for smooth transitions. NOT used for beat onset (must be instant)."""
     return current + speed * (target - current)
 
 
@@ -173,14 +173,17 @@ class DMXEngine:
         self.peak_mid = 0.0
 
         # SYNC FIX: Pre-cached Hanning windows keyed by block size.
-        # Avoids creating a new numpy array (~512-1024 floats) every frame.
         self._hanning_cache = {}
+        # P1-6+P1-7: Cached FFT frequency bins and band index slices.
+        # Avoids recomputing np.fft.rfftfreq + np.where 4x every frame.
+        self._fft_freq_cache = {}   # key=(N, sr) → fft_freqs array
+        self._band_idx_cache = {}   # key=(N, sr) → dict of band name → index array
         self.peak_hihat = 0.0
         self.last_palette_rotate = 0.0
-        self.beat_hold_frames = 0  # Hold full brightness for N frames after beat
-        self.beat_hold_color = (255, 0, 50)  # Which color to hold
-        self.prev_bps = 0.0          # Previous beats-per-second for rhythm change detection
-        self.bps_check_time = 0.0    # Last time we checked BPS
+        self.beat_hold_frames = 0
+        self.beat_hold_color = (255, 0, 50)
+        self.prev_bps = 0.0
+        self.bps_check_time = 0.0
         self.color_phase = 0
         self.last_color_change = 0.0
 
@@ -201,6 +204,9 @@ class DMXEngine:
         self.profile_glow_thresh = 0.55
         self.profile_beat_hold = 4
         self.profile_deep_bass_hold = 5
+        # P1-5: Configurable kick-to-mid dominance ratio for vocal suppression.
+        # 1.5 = strict (EDM, no vocals). 1.2 = relaxed (pop/rock with vocals).
+        self.profile_kick_dominance_ratio = 1.5
 
         # Playback control state (IPC via files)
         self.playback_position = 0.0
@@ -251,6 +257,7 @@ class DMXEngine:
             self.profile_glow_thresh = p.get("glow_thresh", self.profile_glow_thresh)
             self.profile_beat_hold = p.get("beat_hold_frames", self.profile_beat_hold)
             self.profile_deep_bass_hold = p.get("deep_bass_hold_frames", self.profile_deep_bass_hold)
+            self.profile_kick_dominance_ratio = p.get("kick_dominance_ratio", self.profile_kick_dominance_ratio)
             # Load palettes if provided
             if "palettes" in p:
                 self.palettes = [(tuple(c1), tuple(c2)) for c1, c2 in p["palettes"]]
@@ -442,8 +449,18 @@ class DMXEngine:
             return None
 
     def _get_active_cue(self, elapsed):
-        for cue in reversed(self.synced_cues):
-            if elapsed >= cue["start"]:
+        """P1-2 FIX: O(1) bisect lookup instead of O(n) reverse scan.
+        Also checks end boundary so we return None when between cues."""
+        import bisect
+        if not self.synced_cues:
+            return None
+        # Binary search on start times
+        if not hasattr(self, '_cue_starts') or len(self._cue_starts) != len(self.synced_cues):
+            self._cue_starts = [c["start"] for c in self.synced_cues]
+        idx = bisect.bisect_right(self._cue_starts, elapsed) - 1
+        if 0 <= idx < len(self.synced_cues):
+            cue = self.synced_cues[idx]
+            if elapsed < cue["end"]:
                 return cue
         return None
 
@@ -454,19 +471,20 @@ class DMXEngine:
     def _render_blackout_punch(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                                kick_color, accent_color, volume, cue, t):
         """Complete darkness between beats. Flash on hits."""
-        # C1/C2 FIX: Apply AI-generated dimmer
+        # P0-1 FIX: Defensive cue access — cue can be None in edge cases
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
+        strobe_ok = cue.get("strobe", False) if cue else False
 
         if is_kick:
             self.out_r, self.out_g, self.out_b = kick_color
             self.out_w = 255.0 * dimmer
             self.out_master = 255.0 * dimmer
-            self.out_strobe = 200.0 if cue.get("strobe", False) else 0.0
+            self.out_strobe = 200.0 if strobe_ok else 0.0
         elif is_snare:
             self.out_r, self.out_g, self.out_b = accent_color
             self.out_w = 150.0 * dimmer
             self.out_master = 255.0 * dimmer
-            self.out_strobe = 200.0 if cue.get("strobe", False) else 0.0
+            self.out_strobe = 200.0 if strobe_ok else 0.0
         else:
             self.out_r = ema(self.out_r, 0, 0, 0.4)
             self.out_g = ema(self.out_g, 0, 0, 0.4)
@@ -538,20 +556,26 @@ class DMXEngine:
     def _render_buildup_ramp(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                              kick_color, accent_color, volume, cue, t):
         """Progressive intensity ramp for buildup sections."""
-        section_start = cue.get("start", 0)
-        section_end = cue.get("end", section_start + 8)
+        # P2-7 FIX: Apply dimmer and energy (was missed in C1/C2 pass)
+        dimmer = (cue.get("dimmer", 70) if cue else 70) / 100.0
+        energy = cue.get("energy", 5) if cue else 5
+
+        section_start = cue.get("start", 0) if cue else 0
+        section_end = cue.get("end", section_start + 8) if cue else 8
         duration = max(1.0, section_end - section_start)
         progress = min(1.0, max(0.0, (t - section_start) / duration))
 
-        brightness = 0.2 + progress * 0.8
-        strobe_val = progress * 200 if progress > 0.5 else 0
+        brightness = (0.2 + progress * 0.8) * dimmer
+        # Higher energy = more aggressive strobe during ramp
+        strobe_threshold = 0.7 - (energy / 20.0)  # energy 10 → strobe at 0.2 progress
+        strobe_val = progress * 200 if progress > strobe_threshold else 0
 
         color = lerp_color(kick_color, accent_color, progress)
 
         self.out_r = ema(self.out_r, color[0] * brightness, 0.15, 0.1)
         self.out_g = ema(self.out_g, color[1] * brightness, 0.15, 0.1)
         self.out_b = ema(self.out_b, color[2] * brightness, 0.15, 0.1)
-        self.out_w = ema(self.out_w, 255.0 * progress * kick_i if is_kick else self.out_w * 0.9, 0.8, 0.3)
+        self.out_w = ema(self.out_w, 255.0 * progress * kick_i * dimmer if is_kick else self.out_w * 0.9, 0.8, 0.3)
         self.out_master = ema(self.out_master, 255.0 * brightness, 0.1, 0.05)
         self.out_strobe = strobe_val
 
@@ -811,9 +835,11 @@ class DMXEngine:
             return "beat_reactive"
 
         history = list(self.volume_history)
-        past_energy = float(np.mean(history[:60]))
-        recent_energy = float(np.mean(history[-30:]))
         overall_avg = float(np.mean(history))
+        # P0-2 FIX: When <60 samples, past_energy defaults to overall_avg
+        # so the past-vs-recent comparison doesn't collapse to always-equal.
+        past_energy = float(np.mean(history[:60])) if len(history) >= 60 else overall_avg
+        recent_energy = float(np.mean(history[-30:]))
 
         time_in_state = current_time - self.energy_state_since
         self.drop_cooldown = max(0, self.drop_cooldown - 0.023)
@@ -921,12 +947,26 @@ class DMXEngine:
         # reduction. Without this, real kick drums would be too quiet to break
         # the existing 0.05-0.65 profile thresholds.
         fft_data = (np.abs(yf) / N) * 2.0
-        fft_freqs = np.fft.rfftfreq(N, 1.0 / sr)  # Use actual sample rate, not hardcoded
 
-        kick_mag = get_band_mag(fft_data, fft_freqs, KICK_LO, KICK_HI)
-        snare_mag = get_band_mag(fft_data, fft_freqs, SNARE_LO, SNARE_HI)
-        mid_mag = get_band_mag(fft_data, fft_freqs, MID_LO, MID_HI)
-        hihat_mag = get_band_mag(fft_data, fft_freqs, HIHAT_LO, HIHAT_HI)
+        # P1-6+P1-7 FIX: Cache FFT frequency bins AND band index arrays.
+        # Saves 5 numpy array allocations per frame (fft_freqs + 4 np.where calls).
+        cache_key = (N, sr)
+        if cache_key not in self._fft_freq_cache:
+            fft_freqs = np.fft.rfftfreq(N, 1.0 / sr)
+            self._fft_freq_cache[cache_key] = fft_freqs
+            # Precompute band index arrays — these never change for same N+sr
+            self._band_idx_cache[cache_key] = {
+                'kick': np.where((fft_freqs >= KICK_LO) & (fft_freqs <= KICK_HI))[0],
+                'snare': np.where((fft_freqs >= SNARE_LO) & (fft_freqs <= SNARE_HI))[0],
+                'mid': np.where((fft_freqs >= MID_LO) & (fft_freqs <= MID_HI))[0],
+                'hihat': np.where((fft_freqs >= HIHAT_LO) & (fft_freqs <= HIHAT_HI))[0],
+            }
+        bands = self._band_idx_cache[cache_key]
+
+        kick_mag = float(np.mean(fft_data[bands['kick']])) if len(bands['kick']) > 0 else 0.0
+        snare_mag = float(np.mean(fft_data[bands['snare']])) if len(bands['snare']) > 0 else 0.0
+        mid_mag = float(np.mean(fft_data[bands['mid']])) if len(bands['mid']) > 0 else 0.0
+        hihat_mag = float(np.mean(fft_data[bands['hihat']])) if len(bands['hihat']) > 0 else 0.0
 
         self.agc_kick += AGC_SPEED * (kick_mag - self.agc_kick)
         self.agc_snare += AGC_SPEED * (snare_mag - self.agc_snare)
@@ -966,14 +1006,16 @@ class DMXEngine:
         # below 150Hz relative to 400-2000Hz mids. Vocals are the opposite —
         # their fundamental (150-400Hz) and harmonics dominate the mid range.
         # If mid_mag >= kick_mag, the energy is vocal, not percussive.
-        kick_dominates = kick_mag > (mid_mag * 1.5)  # Kick must be 1.5x louder than mids
+        # P1-5 FIX: Use profile-configurable ratio (default 1.5 for EDM, lower for pop/rock)
+        kick_dominates = kick_mag > (mid_mag * self.profile_kick_dominance_ratio)
         #
         # Gate 2 — Snare flux sharpness: Real snare hits create an explosive
         # transient (huge spectral flux). Vocal consonants create gradual energy
         # changes. We require the flux component to dominate the steady-state
         # magnitude — if most of the energy is steady-state, it's sustained audio
         # (vocals/instruments), not a percussive hit.
-        snare_is_transient = snare_flux > (snare_hit * 0.8) if snare_hit > 0 else snare_flux > 0
+        # P1-4 FIX: Add minimum flux threshold to prevent noise triggering
+        snare_is_transient = snare_flux > (snare_hit * 0.5) if snare_hit > 0 else snare_flux > 0.001
 
         is_kick = kick_i > kick_thresh and cooldown_ok and kick_dominates
         is_snare = snare_i > snare_thresh and cooldown_ok and snare_is_transient
@@ -1109,7 +1151,8 @@ class DMXEngine:
         state_write_counter = 0
 
         try:
-            chunk_size = 1024
+            # P1-1 FIX: Use BLOCK_SIZE for consistency with loopback mode
+            chunk_size = BLOCK_SIZE
             data = wf.readframes(chunk_size)
             frames_played = 0
             last_cue_name = ""
