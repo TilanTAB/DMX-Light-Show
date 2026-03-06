@@ -387,6 +387,29 @@ def _validate_and_repair_plan(plan):
 
     plan["cues"] = valid_cues
 
+    # C3 FIX: Validate timeline coverage — no gaps, no overlaps.
+    # Without this, the LLM might leave 5-10 second dark patches between cues.
+    if len(valid_cues) >= 2:
+        # Sort by start_time to ensure correct ordering
+        valid_cues.sort(key=lambda c: c.get("start_time", 0))
+        
+        # Ensure first cue starts at 0.0
+        if valid_cues[0].get("start_time", 0) > 0.5:
+            logger.warning(f"C3: First cue starts at {valid_cues[0]['start_time']}s, forcing to 0.0")
+            valid_cues[0]["start_time"] = 0.0
+        
+        # Close gaps: set each cue's start_time = previous cue's end_time
+        for i in range(1, len(valid_cues)):
+            prev_end = valid_cues[i - 1].get("end_time", 0)
+            curr_start = valid_cues[i].get("start_time", 0)
+            gap = curr_start - prev_end
+            if gap > 0.5:  # More than 0.5s gap = needs fixing
+                logger.warning(f"C3: {gap:.1f}s gap before cue {i} ('{valid_cues[i].get('section_name','')}') — closing")
+                valid_cues[i]["start_time"] = prev_end
+            elif gap < -0.5:  # Overlap
+                logger.warning(f"C3: {-gap:.1f}s overlap at cue {i} — trimming")
+                valid_cues[i]["start_time"] = prev_end
+
     # Validate phrases
     phrases = plan.get("phrases", [])
     if isinstance(phrases, list):

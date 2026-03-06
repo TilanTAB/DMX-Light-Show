@@ -334,10 +334,39 @@ def analyze_audio_structure(filepath):
     # ================================================================
     # STEP 3: Global Song Metrics
     # ================================================================
-    # BPM estimation from total beat count
-    total_beats = sum(s["beat_density"] for s in timeline)
-    approx_bpm = (total_beats / total_duration) * 60.0
-    adjusted_bpm = round(max(70.0, min(180.0, approx_bpm)), 1)
+    # A2 FIX: Autocorrelation-based BPM estimation.
+    # The old method counted any transient as a beat and was wildly inaccurate.
+    # Autocorrelation finds the strongest periodic repetition in the energy
+    # signal, which naturally corresponds to the tempo's beat period.
+    rms_array = np.array(rms_values, dtype=np.float64)
+    rms_centered = rms_array - np.mean(rms_array)
+    
+    # Autocorrelation via FFT (much faster than naive O(n²))
+    fft_rms = np.fft.rfft(rms_centered)
+    autocorr = np.fft.irfft(np.abs(fft_rms) ** 2)
+    autocorr = autocorr[:len(rms_array)]  # Trim to original length
+    
+    # Search for the best BPM in the 60-200 BPM range
+    # Convert BPM to lag in segments: lag = 60 / (BPM * segment_duration)
+    min_lag = max(1, int(60.0 / (200.0 * segment_duration)))  # 200 BPM
+    max_lag = min(len(autocorr) - 1, int(60.0 / (60.0 * segment_duration)))  # 60 BPM
+    
+    if max_lag > min_lag and len(autocorr) > max_lag:
+        ac_slice = autocorr[min_lag:max_lag + 1]
+        best_lag = np.argmax(ac_slice) + min_lag
+        if best_lag > 0:
+            adjusted_bpm = round(60.0 / (best_lag * segment_duration), 1)
+            # Sanity check: if autocorrelation peak is weak, result is unreliable
+            if autocorr[best_lag] < autocorr[0] * 0.05:
+                # Fallback to old beat-counting method
+                total_beats = sum(s["beat_density"] for s in timeline)
+                adjusted_bpm = round(max(70.0, min(180.0, (total_beats / total_duration) * 60.0)), 1)
+        else:
+            adjusted_bpm = 120.0  # Safe default
+    else:
+        # Very short song or edge case — fallback
+        total_beats = sum(s["beat_density"] for s in timeline)
+        adjusted_bpm = round(max(70.0, min(180.0, (total_beats / total_duration) * 60.0)), 1)
     
     # Dynamic range (difference between loudest and quietest sections)
     dynamic_range = round(max(rms_values) / max(min(rms_values), 0.0001), 1)
@@ -375,6 +404,22 @@ def analyze_audio_structure(filepath):
             if s["time"] - vocal_start >= 4.0:  # Only count 4s+ vocal sections
                 vocal_sections.append({"start": vocal_start, "end": s["time"]})
     
+    # A3 FIX: Energy arc — a compact summary of the song's emotional trajectory.
+    # The LLM can see ["low","medium","peak","low","peak","low"] and immediately
+    # know the song has two climaxes with a calm breakdown in between.
+    max_sec_energy = max((s.get("avg_energy", 0) for s in sections), default=0.001)
+    energy_arc = []
+    for sec in sections:
+        rel = sec.get("avg_energy", 0) / max(max_sec_energy, 0.001)
+        if rel < 0.35:
+            energy_arc.append("low")
+        elif rel < 0.65:
+            energy_arc.append("medium")
+        elif rel < 0.85:
+            energy_arc.append("high")
+        else:
+            energy_arc.append("peak")
+    
     telemetry = {
         "song_metrics": {
             "bpm": adjusted_bpm,
@@ -382,6 +427,7 @@ def analyze_audio_structure(filepath):
             "dynamic_range_ratio": dynamic_range,
             "overall_energy": "High" if avg_rms_total > 0.05 else "Medium" if avg_rms_total > 0.02 else "Chill",
             "num_sections_detected": len(sections),
+            "energy_arc": energy_arc,  # A3: e.g., ["low","medium","peak","low","peak","low"]
         },
         "structural_sections": sections,
         "spectral_timeline": timeline,
