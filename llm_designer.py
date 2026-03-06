@@ -278,9 +278,9 @@ Output ONLY the JSON object. No explanation, no markdown, no comments."""
         ],
         "response_format": {"type": "json_object"},
         # B3 FIX: Control output quality and prevent truncation
-        "temperature": 0.4,       # Low = consistent, well-formed JSON structure
-        "max_tokens": 4096,       # Prevent truncated responses on long songs
-        "top_p": 0.9,             # Slight diversity in color palette choices
+        "temperature": 0.4,                  # Low = consistent, well-formed JSON
+        "max_completion_tokens": 4096,       # Newer Azure API parameter name
+        "top_p": 0.9,                        # Slight diversity in color choices
     }
 
     # Retry with backoff for transient failures
