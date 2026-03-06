@@ -453,11 +453,19 @@ class DMXEngine:
 
     def _render_blackout_punch(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                                kick_color, accent_color, volume, cue, t):
-        """BLACKOUT between beats → instant WHITE+COLOR blast on kick/snare."""
-        if is_kick or is_snare:
-            self.out_r, self.out_g, self.out_b = kick_color if is_kick else accent_color
-            self.out_w = 255.0
-            self.out_master = 255.0
+        """Complete darkness between beats. Flash on hits."""
+        # C1/C2 FIX: Apply AI-generated dimmer
+        dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
+
+        if is_kick:
+            self.out_r, self.out_g, self.out_b = kick_color
+            self.out_w = 255.0 * dimmer
+            self.out_master = 255.0 * dimmer
+            self.out_strobe = 200.0 if cue.get("strobe", False) else 0.0
+        elif is_snare:
+            self.out_r, self.out_g, self.out_b = accent_color
+            self.out_w = 150.0 * dimmer
+            self.out_master = 255.0 * dimmer
             self.out_strobe = 200.0 if cue.get("strobe", False) else 0.0
         else:
             self.out_r = ema(self.out_r, 0, 0, 0.4)
@@ -487,36 +495,44 @@ class DMXEngine:
     def _render_bass_white_blast(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                                  kick_color, accent_color, volume, cue, t):
         """WHITE LED blasts on every kick. Colored wash underneath from mids."""
+        # C1/C2 FIX: Apply AI-generated energy and dimmer
+        energy = cue.get("energy", 7) if cue else 7
+        dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
+        energy_scale = 0.5 + (energy / 10.0)  # 0.6 to 1.5
+
         if is_kick:
-            self.out_w = 255.0
-            self.out_master = 255.0
+            self.out_w = 255.0 * dimmer
+            self.out_master = 255.0 * dimmer
         else:
             self.out_w = ema(self.out_w, 0, 0, 0.35)
 
-        wash_brightness = max(mid_i * 0.4, 0.1)
-        snare_boost = 0.6 if is_snare else 0.0
+        wash_brightness = max(mid_i * 0.4 * energy_scale, 0.1)
+        snare_boost = 0.6 * energy_scale if is_snare else 0.0
 
         self.out_r = ema(self.out_r, kick_color[0] * wash_brightness + accent_color[0] * snare_boost, 0.3, 0.08)
         self.out_g = ema(self.out_g, kick_color[1] * wash_brightness + accent_color[1] * snare_boost, 0.3, 0.08)
         self.out_b = ema(self.out_b, kick_color[2] * wash_brightness + accent_color[2] * snare_boost, 0.3, 0.08)
-        self.out_master = ema(self.out_master, max(120.0, volume * 4000), 0.5, 0.15)
+        self.out_master = ema(self.out_master, max(120.0 * dimmer, volume * 4000), 0.5, 0.15)
         self.out_strobe = 0
 
     def _render_color_chase(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                             kick_color, accent_color, volume, cue, t):
         """Alternates between kick_color and accent_color on EVERY beat."""
+        # C1/C2 FIX: Apply AI-generated dimmer
+        dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
+
         if is_kick or is_snare:
             use_primary = (self.total_beat_count % 2 == 0)
             color = kick_color if use_primary else accent_color
             self.out_r, self.out_g, self.out_b = color
-            self.out_w = 80.0 if is_kick else 0.0
-            self.out_master = 255.0
+            self.out_w = 80.0 * dimmer if is_kick else 0.0
+            self.out_master = 255.0 * dimmer
         else:
             self.out_r = ema(self.out_r, 0, 0, 0.3)
             self.out_g = ema(self.out_g, 0, 0, 0.3)
             self.out_b = ema(self.out_b, 0, 0, 0.3)
             self.out_w = ema(self.out_w, 0, 0, 0.4)
-            self.out_master = ema(self.out_master, 40, 0, 0.15)
+            self.out_master = ema(self.out_master, 40 * dimmer, 0, 0.15)
         self.out_strobe = 0
 
     def _render_buildup_ramp(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
@@ -558,28 +574,35 @@ class DMXEngine:
     def _render_strobe_blast(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                              kick_color, accent_color, volume, cue, t):
         """Rapid full-white strobe. Maximum sensory impact."""
+        # C2 FIX: Apply dimmer (strobe always max energy by design)
+        dimmer = (cue.get("dimmer", 100) if cue else 100) / 100.0
         self.out_r, self.out_g, self.out_b = accent_color
-        self.out_w = 255.0
-        self.out_master = 255.0
+        self.out_w = 255.0 * dimmer
+        self.out_master = 255.0 * dimmer
         self.out_strobe = 240.0
 
     def _render_fast_pulse(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                            kick_color, accent_color, volume, cue, t):
         """Rapid beat-synced pulses with hi-hat shimmer."""
+        # C1/C2 FIX: Apply AI-generated energy and dimmer
+        energy = cue.get("energy", 7) if cue else 7
+        dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
+        decay_speed = 0.3 + (energy / 20.0)  # Higher energy = faster decay = sharper pulses
+
         if is_kick:
             self.out_r, self.out_g, self.out_b = kick_color
-            self.out_w = 200.0
-            self.out_master = 255.0
+            self.out_w = 200.0 * dimmer
+            self.out_master = 255.0 * dimmer
         elif is_snare:
             self.out_r, self.out_g, self.out_b = accent_color
-            self.out_w = 100.0
-            self.out_master = 255.0
+            self.out_w = 100.0 * dimmer
+            self.out_master = 255.0 * dimmer
         else:
-            self.out_r = ema(self.out_r, 0, 0, 0.5)
-            self.out_g = ema(self.out_g, 0, 0, 0.5)
-            self.out_b = ema(self.out_b, 0, 0, 0.5)
-            self.out_w = ema(self.out_w, hihat_i * 100, 0.6, 0.4)
-            self.out_master = ema(self.out_master, 30, 0, 0.25)
+            self.out_r = ema(self.out_r, 0, 0, decay_speed)
+            self.out_g = ema(self.out_g, 0, 0, decay_speed)
+            self.out_b = ema(self.out_b, 0, 0, decay_speed)
+            self.out_w = ema(self.out_w, hihat_i * 100 * dimmer, 0.6, 0.4)
+            self.out_master = ema(self.out_master, 30 * dimmer, 0, 0.25)
         self.out_strobe = 0
 
     def _render_beat_reactive(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
@@ -587,6 +610,7 @@ class DMXEngine:
         """Default beat-reactive mode: kick→color_1, snare→color_2, bass→white.
         In loopback mode, maintains an ambient floor so lights are always alive."""
         energy = cue.get("energy", 5) if cue else 5
+        dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0  # C2 FIX
         energy_boost = 0.5 + (energy / 10.0)
         is_loopback = (self.playback_state == "stopped")  # Loopback never sets playback_state
 
@@ -624,7 +648,7 @@ class DMXEngine:
             tb = max(tb, kick_color[2] * ambient_floor)
 
         tw = 255.0 if is_kick else (120.0 if is_snare else max(hihat_i * 100, ambient_floor * 50))
-        tm = 255.0 if (is_kick or is_snare) else max(80.0, volume * 8000, ambient_floor * 255)
+        tm = (255.0 if (is_kick or is_snare) else max(80.0, volume * 8000, ambient_floor * 255)) * dimmer  # C2 FIX
 
         is_beat = is_kick or is_snare
         att = 0.95 if is_beat else 0.15
@@ -645,6 +669,9 @@ class DMXEngine:
     def _render_rainbow_sweep(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                               kick_color, accent_color, volume, cue, t):
         """Slowly cycle through hue spectrum. Beats cause brightness pulse."""
+        # C1/C2 FIX: Apply AI-generated dimmer
+        dimmer = (cue.get("dimmer", 70) if cue else 70) / 100.0
+
         hue = (t * 0.125) % 1.0
         h_i = int(hue * 6)
         f = hue * 6 - h_i
@@ -655,10 +682,10 @@ class DMXEngine:
         ]
         rgb = colors[h_i % 6]
 
-        brightness = 0.5 + 0.5 * min(1.0, volume * 3000)
+        brightness = (0.5 + 0.5 * min(1.0, volume * 3000)) * dimmer
         if is_kick:
-            brightness = 1.0
-            self.out_w = 150.0
+            brightness = 1.0 * dimmer
+            self.out_w = 150.0 * dimmer
         else:
             self.out_w = ema(self.out_w, 0, 0, 0.3)
 
