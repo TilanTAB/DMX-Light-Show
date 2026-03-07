@@ -175,19 +175,38 @@ Analyze the telemetry and pick the BEST behavior for each section:
   USE FOR: Festive moments, euphoric buildups, celebratory sections.
   FEEL: Colorful, joyful. Like a festival sunset.
 
+=== AMBIENT / CHILL BEHAVIORS ===
+Use these for quiet sections, breakdowns, lo-fi, acoustic, and ambient music.
+
+"ocean_drift" — Slow wave undulations. Two overlapping sine waves create gentle color swelling. Bass adds subtle warmth but never flashes.
+  USE FOR: Ambient intros, zen breakdowns, downtempo sections.
+  FEEL: Dreamy, oceanic. Like light underwater.
+
+"candlelight" — Warm amber flicker with organic noise. Volume modulates flicker intensity.
+  USE FOR: Acoustic sets, ballads, intimate moments.
+  FEEL: Warm, intimate. Like a room lit by candles.
+
+"sunset_fade" — Slow cinematic crossfade from color_1 to color_2 over the section. No beat reaction at all.
+  USE FOR: Long vocal sections, outros, emotional transitions.
+  FEEL: Cinematic, emotional. A slow color journey.
+
+"aurora_shimmer" — Three independent sine waves on R, G, B create a slowly evolving color field that never repeats.
+  USE FOR: Ambient electronic, chillwave, post-rock, atmospheric sections.
+  FEEL: Ethereal, mesmerizing. Like northern lights.
+
 === NARRATIVE ARC TEMPLATE ===
 A well-designed show follows this emotional curve:
-  Intro: slow_breathe (dim, mysterious)
-  → Verse 1: static_wash (warm, focused)
-  → Bridge: buildup_ramp (rising tension!)
+  Intro: ocean_drift or aurora_shimmer (gentle, mysterious)
+  → Verse 1: candlelight or static_wash (warm, focused)
+  → Pre-Chorus: buildup_ramp (rising tension!)
   → Chorus 1: bass_white_blast (IMPACT! White on kicks!)
   → Post-Chorus: beat_reactive (ride the energy)
-  → Verse 2: static_wash (contrast: pull back)
+  → Verse 2: sunset_fade (contrast: pull back cinematically)
   → Hook: buildup_ramp (tension again)
   → Chorus 2: blackout_punch (even MORE intense than Chorus 1!)
-  → Bridge/Breakdown: slow_breathe (dramatic contrast, reset)
+  → Bridge/Breakdown: ocean_drift or aurora_shimmer (dramatic reset)
   → Final Chorus: strobe_blast 2s → bass_white_blast (ultimate climax)
-  → Outro: slow_breathe (fade to darkness)
+  → Outro: sunset_fade (fade to darkness)
 
 === REQUIRED JSON FORMAT ===
 {{
@@ -333,6 +352,8 @@ VALID_BEHAVIORS = {
     "slow_breathe", "fast_pulse", "color_chase", "strobe_blast",
     "static_wash", "rainbow_sweep", "buildup_ramp", "instant_flash",
     "beat_reactive", "bass_white_blast", "blackout_punch",
+    # Ambient/chill behaviors
+    "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer",
 }
 
 

@@ -64,6 +64,8 @@ VALID_BEHAVIORS = {
     "blackout_punch", "slow_breathe", "bass_white_blast", "color_chase",
     "buildup_ramp", "static_wash", "strobe_blast", "fast_pulse",
     "beat_reactive", "rainbow_sweep", "instant_flash",
+    # Ambient/chill behaviors
+    "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer",
 }
 
 
@@ -231,6 +233,11 @@ class DMXEngine:
             "beat_reactive": self._render_beat_reactive,
             "rainbow_sweep": self._render_rainbow_sweep,
             "instant_flash": self._render_blackout_punch,
+            # Ambient/chill behaviors
+            "ocean_drift": self._render_ocean_drift,
+            "candlelight": self._render_candlelight,
+            "sunset_fade": self._render_sunset_fade,
+            "aurora_shimmer": self._render_aurora_shimmer,
         }
 
     # ----------------------------------------------------------
@@ -720,6 +727,123 @@ class DMXEngine:
         self.out_strobe = 0
 
     # ============================================================
+    # AMBIENT / CHILL RENDERERS
+    # Gentle, non-punchy behaviors for quiet sections, lo-fi,
+    # ambient, acoustic, and chill electronic music.
+    # ============================================================
+
+    def _render_ocean_drift(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                            kick_color, accent_color, volume, cue, t):
+        """Slow wave undulations — like light refracting through water.
+        Two overlapping sine waves at different speeds create gentle swelling.
+        Bass gives a subtle warm pulse but never flashes."""
+        dimmer = (cue.get("dimmer", 50) if cue else 50) / 100.0
+
+        # Two sine waves at non-harmonic ratios → never-repeating pattern
+        wave1 = math.sin(t * 0.3) * 0.5 + 0.5       # ~3.3s period
+        wave2 = math.sin(t * 0.17 + 1.2) * 0.5 + 0.5  # ~5.9s period
+        blend = (wave1 * 0.6 + wave2 * 0.4)  # Combined 0.0-1.0
+
+        color = lerp_color(kick_color, accent_color, blend)
+        brightness = (0.3 + 0.3 * blend) * dimmer
+
+        # Bass adds a gentle warmth pulse (never a flash)
+        bass_warmth = min(0.15, kick_i * 0.3)
+        brightness += bass_warmth
+
+        self.out_r = ema(self.out_r, color[0] * brightness, 0.03, 0.03)
+        self.out_g = ema(self.out_g, color[1] * brightness, 0.03, 0.03)
+        self.out_b = ema(self.out_b, color[2] * brightness, 0.03, 0.03)
+        self.out_w = ema(self.out_w, 20.0 * brightness, 0.02, 0.02)
+        self.out_master = ema(self.out_master, 200.0 * brightness, 0.04, 0.03)
+        self.out_strobe = 0
+
+    def _render_candlelight(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                            kick_color, accent_color, volume, cue, t):
+        """Warm organic flicker — like a room lit by candles.
+        Uses pseudo-random noise for natural flicker instead of periodic sine.
+        Volume modulates flicker intensity: quiet=steady glow, loud=more movement."""
+        dimmer = (cue.get("dimmer", 45) if cue else 45) / 100.0
+
+        # Pseudo-random flicker using multiple incommensurate sine waves
+        # (cheaper than actual Perlin noise, visually indistinguishable on LEDs)
+        flicker = (
+            math.sin(t * 7.3) * 0.15 +
+            math.sin(t * 13.1 + 2.0) * 0.10 +
+            math.sin(t * 23.7 + 4.5) * 0.05
+        )  # Range: roughly -0.3 to +0.3
+
+        # Volume scales flicker range — quiet music = steady, loud = flickery
+        vol_scale = min(1.0, volume * 2000)
+        flicker_amount = 0.1 + 0.2 * vol_scale  # 0.1 (quiet) to 0.3 (loud)
+        brightness = (0.5 + flicker * flicker_amount) * dimmer
+        brightness = max(0.2 * dimmer, brightness)  # Never goes dark
+
+        # Warm amber base: (255, 160, 40) blended with kick_color
+        warm = lerp_color((255, 160, 40), kick_color, 0.3)
+
+        self.out_r = ema(self.out_r, warm[0] * brightness, 0.08, 0.06)
+        self.out_g = ema(self.out_g, warm[1] * brightness, 0.06, 0.04)
+        self.out_b = ema(self.out_b, warm[2] * brightness, 0.04, 0.03)
+        self.out_w = ema(self.out_w, 40.0 * brightness, 0.05, 0.04)
+        self.out_master = ema(self.out_master, 180.0 * brightness, 0.06, 0.04)
+        self.out_strobe = 0
+
+    def _render_sunset_fade(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                            kick_color, accent_color, volume, cue, t):
+        """Slow cinematic crossfade from color_1 to color_2 over section duration.
+        No beat reaction — purely time-based. Mids add subtle white warmth."""
+        dimmer = (cue.get("dimmer", 55) if cue else 55) / 100.0
+
+        section_start = cue.get("start", 0) if cue else 0
+        section_end = cue.get("end", section_start + 20) if cue else 20
+        duration = max(1.0, section_end - section_start)
+        progress = min(1.0, max(0.0, (t - section_start) / duration))
+
+        # Smooth S-curve (smoothstep) instead of linear for cinematic feel
+        smooth = progress * progress * (3.0 - 2.0 * progress)
+        color = lerp_color(kick_color, accent_color, smooth)
+        brightness = (0.4 + 0.2 * smooth) * dimmer
+
+        # Mids add subtle white warmth
+        mid_warmth = min(0.1, mid_i * 0.2)
+
+        self.out_r = ema(self.out_r, color[0] * brightness, 0.02, 0.02)
+        self.out_g = ema(self.out_g, color[1] * brightness, 0.02, 0.02)
+        self.out_b = ema(self.out_b, color[2] * brightness, 0.02, 0.02)
+        self.out_w = ema(self.out_w, 50.0 * (brightness + mid_warmth), 0.03, 0.02)
+        self.out_master = ema(self.out_master, 200.0 * brightness, 0.03, 0.02)
+        self.out_strobe = 0
+
+    def _render_aurora_shimmer(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                               kick_color, accent_color, volume, cue, t):
+        """Multi-frequency color shimmer — like northern lights.
+        Three sine waves at prime ratios modulate R, G, B independently,
+        creating a slowly evolving color field that never repeats."""
+        dimmer = (cue.get("dimmer", 50) if cue else 50) / 100.0
+
+        # Three independent oscillators at incommensurate frequencies
+        r_wave = math.sin(t * 0.23) * 0.5 + 0.5            # ~27s period
+        g_wave = math.sin(t * 0.23 * 1.3 + 2.1) * 0.5 + 0.5  # ~21s period
+        b_wave = math.sin(t * 0.23 * 1.7 + 4.3) * 0.5 + 0.5  # ~16s period
+
+        # Blend oscillator outputs with the AI-chosen colors
+        r = kick_color[0] * r_wave + accent_color[0] * (1 - r_wave)
+        g = kick_color[1] * g_wave + accent_color[1] * (1 - g_wave)
+        b = kick_color[2] * b_wave + accent_color[2] * (1 - b_wave)
+
+        # Volume gently scales brightness (40-70% range, never harsh)
+        vol_brightness = 0.4 + 0.3 * min(1.0, volume * 2000)
+        brightness = vol_brightness * dimmer
+
+        self.out_r = ema(self.out_r, r * brightness, 0.04, 0.03)
+        self.out_g = ema(self.out_g, g * brightness, 0.04, 0.03)
+        self.out_b = ema(self.out_b, b * brightness, 0.04, 0.03)
+        self.out_w = ema(self.out_w, 15.0 * brightness, 0.02, 0.02)
+        self.out_master = ema(self.out_master, 200.0 * brightness, 0.04, 0.03)
+        self.out_strobe = 0
+
+    # ============================================================
     # LOOPBACK DIRECT-DRIVE RENDERER
     # Maps frequency energy directly to light output — no beat
     # onset detection needed. Every frame produces visible light.
@@ -880,17 +1004,32 @@ class DMXEngine:
                 self.energy_state = "high"
                 self.energy_state_since = current_time
 
+        # AUTO-BEHAVIOR DISPATCH: Picks punchy or chill based on energy + BPS
         if self.energy_state == "calm":
-            return "slow_breathe" if beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7 else "beat_reactive"
+            if beats_per_sec < 0.5 and recent_energy < overall_avg * 0.5:
+                # Very quiet — rotate through ambient behaviors for variety
+                ambient_pool = ["ocean_drift", "candlelight", "aurora_shimmer", "sunset_fade"]
+                ambient_idx = int(current_time / 15.0) % len(ambient_pool)  # Switch every 15s
+                return ambient_pool[ambient_idx]
+            elif beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7:
+                return "slow_breathe"
+            elif beats_per_sec < 1.5:
+                return "beat_reactive"  # Light beats → standard
+            else:
+                return "beat_reactive"
         elif self.energy_state == "building":
             return "buildup_ramp"
         elif self.energy_state == "high":
+            # High energy → concert punchy modes based on BPS intensity
             if beats_per_sec > 3.0:
                 return "blackout_punch"
             elif beats_per_sec > 2.0:
                 return "bass_white_blast"
             return "fast_pulse"
         elif self.energy_state == "dropping":
+            # Dropping energy → transition to chill
+            if time_in_state < 2.0:
+                return "sunset_fade"  # Cinematic transition out
             return "slow_breathe"
         return "beat_reactive"
 
