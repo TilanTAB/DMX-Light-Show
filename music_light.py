@@ -1186,14 +1186,15 @@ class DMXEngine:
         t_start_render = time.perf_counter()
         
         if is_loopback:
-            # LOOPBACK: Direct energy-to-light with profile-aware color cycling.
+            # LOOPBACK: Auto-detect behavior based on energy + BPS.
+            # Ambient/chill behaviors use the standard renderer dispatch.
+            # Punchy behaviors use the loopback direct-drive renderer.
             t = self.frame_counter * BLOCK_SIZE / sr
 
             # ── Color cycling based on profile mode ──
             cycle_mode = self.profile_color_cycle_mode
 
             if cycle_mode == "rhythm":
-                # Rhythm-change detection: advance color on BPS shifts
                 if current_time - self.bps_check_time > 2.0:
                     bps_change = abs(beats_per_sec - self.prev_bps)
                     bps_threshold = max(0.5, self.prev_bps * self.profile_rhythm_change_pct)
@@ -1206,28 +1207,43 @@ class DMXEngine:
                     self.prev_bps = beats_per_sec
                     self.bps_check_time = current_time
 
-                # Fallback timer
                 if current_time - self.last_color_change > self.profile_color_cycle_interval:
                     self.color_phase = (self.color_phase + 1) % 4
                     self.last_color_change = current_time
 
             elif cycle_mode == "time":
-                # Fixed time-based rotation
                 self.color_phase = int(t / self.profile_color_cycle_interval) % 4
 
             elif cycle_mode == "beat":
-                # Advance on every 4th beat
                 self.color_phase = (self.total_beat_count // 4) % 4
 
             color_phase = self.color_phase
-
             kick_color, accent_color = self.palettes[self.current_palette_idx % len(self.palettes)]
-            self._render_loopback_direct(
-                kick_mag, snare_mag, mid_mag, hihat_mag,
-                kick_i, snare_i, hihat_i, mid_i,
-                is_kick, is_snare,
-                kick_color, accent_color, volume, t, color_phase
-            )
+
+            # ── Auto-behavior detection: picks chill or punchy ──
+            auto_behavior = self._detect_auto_behavior(volume, kick_i, snare_i, current_time, beats_per_sec)
+            self.current_behavior = auto_behavior
+
+            # Ambient/chill behaviors → use the standard renderer dispatch
+            # (these renderers take the same args as synced-mode renderers)
+            ambient_behaviors = {"ocean_drift", "candlelight", "sunset_fade",
+                                 "aurora_shimmer", "slow_breathe", "static_wash",
+                                 "buildup_ramp", "rainbow_sweep"}
+
+            if auto_behavior in ambient_behaviors:
+                cue = {"dimmer": 50, "energy": 3, "start": 0, "end": 60,
+                        "strobe": False, "fade": 3.0}
+                renderer = self._behavior_map.get(auto_behavior, self._render_beat_reactive)
+                renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                         kick_color, accent_color, volume, cue, t)
+            else:
+                # Punchy behaviors → loopback direct renderer (full R→B→G→W system)
+                self._render_loopback_direct(
+                    kick_mag, snare_mag, mid_mag, hihat_mag,
+                    kick_i, snare_i, hihat_i, mid_i,
+                    is_kick, is_snare,
+                    kick_color, accent_color, volume, t, color_phase
+                )
         else:
             if self.synced_cues:
                 cue = self._get_active_cue(elapsed_seconds)
