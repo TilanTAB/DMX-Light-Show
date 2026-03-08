@@ -364,6 +364,7 @@ class DMXEngine:
             "state": "paused" if self.is_paused else self.playback_state,
             "cue_name": self.current_cue_name,
             "behavior": self.current_behavior,
+            "energy_state": self.energy_state,
         }
         tmp = self._state_file + ".tmp"
         try:
@@ -968,28 +969,37 @@ class DMXEngine:
         time_in_state = current_time - self.energy_state_since
         self.drop_cooldown = max(0, self.drop_cooldown - 0.023)
 
+        # FAST TRANSITION: BPS is the primary signal. If beats are fast,
+        # skip the slow volume-ratio state machine and jump directly.
         if self.energy_state == "calm":
-            if recent_energy > past_energy * 1.8 and recent_energy > MIN_VOLUME_GATE * 3:
+            if beats_per_sec > 2.0:
+                # Fast beats = immediate escalation, no "building" phase needed
+                self.energy_state = "high"
+                self.energy_state_since = current_time
+            elif beats_per_sec > 1.2 and recent_energy > overall_avg * 0.8:
                 self.energy_state = "building"
                 self.energy_state_since = current_time
-            elif beats_per_sec > 2.5 and recent_energy > overall_avg * 1.3:
-                self.energy_state = "high"
+            elif recent_energy > past_energy * 1.5 and recent_energy > MIN_VOLUME_GATE * 3:
+                self.energy_state = "building"
                 self.energy_state_since = current_time
 
         elif self.energy_state == "building":
-            if recent_energy > past_energy * 2.5 and self.drop_cooldown <= 0:
+            if beats_per_sec > 2.5 or (recent_energy > past_energy * 2.0 and self.drop_cooldown <= 0):
                 self.energy_state = "high"
                 self.energy_state_since = current_time
                 self.drop_cooldown = 5.0
-            elif recent_energy < past_energy * 0.6:
+            elif recent_energy < past_energy * 0.6 and beats_per_sec < 0.8:
                 self.energy_state = "calm"
                 self.energy_state_since = current_time
-            elif time_in_state > 12.0:
-                self.energy_state = "high" if beats_per_sec > 2.0 else "calm"
+            elif time_in_state > 8.0:
+                self.energy_state = "high" if beats_per_sec > 1.5 else "calm"
                 self.energy_state_since = current_time
 
         elif self.energy_state == "high":
-            if recent_energy < overall_avg * 0.5 and time_in_state > 3.0:
+            if beats_per_sec < 0.5 and recent_energy < overall_avg * 0.5 and time_in_state > 2.0:
+                self.energy_state = "dropping"
+                self.energy_state_since = current_time
+            elif beats_per_sec < 1.0 and time_in_state > 8.0:
                 self.energy_state = "dropping"
                 self.energy_state_since = current_time
             elif time_in_state > 20.0:
@@ -997,11 +1007,11 @@ class DMXEngine:
                 self.energy_state_since = current_time
 
         elif self.energy_state == "dropping":
-            if time_in_state > 4.0:
-                self.energy_state = "calm"
-                self.energy_state_since = current_time
-            elif recent_energy > overall_avg * 1.5:
+            if beats_per_sec > 1.5 or recent_energy > overall_avg * 1.5:
                 self.energy_state = "high"
+                self.energy_state_since = current_time
+            elif time_in_state > 3.0:
+                self.energy_state = "calm"
                 self.energy_state_since = current_time
 
         # AUTO-BEHAVIOR DISPATCH: Picks punchy or chill based on energy + BPS
@@ -1223,6 +1233,12 @@ class DMXEngine:
             # ── Auto-behavior detection: picks chill or punchy ──
             auto_behavior = self._detect_auto_behavior(volume, kick_i, snare_i, current_time, beats_per_sec)
             self.current_behavior = auto_behavior
+
+            # Write IPC state every ~50 frames (~1s) so the UI shows the sub-mode
+            if self.frame_counter % 50 == 0:
+                self.playback_state = "loopback"
+                self.current_cue_name = f"{self.energy_state} | {auto_behavior}"
+                self._write_playback_state()
 
             # Ambient/chill behaviors → use the standard renderer dispatch
             # (these renderers take the same args as synced-mode renderers)
