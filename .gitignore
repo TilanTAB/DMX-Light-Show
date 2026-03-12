@@ -17,6 +17,7 @@ env/
 *.egg-info/
 dist/
 build/
+*.spec.warn
 
 # ==========================================
 # Node / Frontend

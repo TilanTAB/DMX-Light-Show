@@ -6,7 +6,11 @@
  * 
  * If the backend URL ever changes, you update ONLY this constant:
  */
-const API_BASE = "http://localhost:8000";
+// In production (PyInstaller build), the React app is served from FastAPI on the
+// same origin, so relative URLs work directly ("" base → "/api/shows" etc.).
+// In development, Vite's proxy (configured in vite.config.js) forwards /api/*
+// to localhost:8000, so relative URLs also work.
+const API_BASE = "";
 
 /**
  * Helper: wraps fetch() with error handling and JSON parsing.
