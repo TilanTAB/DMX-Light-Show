@@ -649,15 +649,15 @@ def play_show(req: PlayRequest):
     with _active_lock:
         _kill_active_process()
         global _active_process
-        cmd = _get_worker_cmd("music_light.py", ["--mode", "synced", "--show", show_file])
+        cmd = _get_worker_cmd("ai_show_player.py", ["--show", show_file])
         _active_process = subprocess.Popen(cmd, cwd=BASE_DIR)
-    return {"message": f"Playing '{req.show_id}' (synced mode)", "pid": _active_process.pid}
+    return {"message": f"Playing '{req.show_id}' (AI show)", "pid": _active_process.pid}
 
 
 @app.post("/api/loopback")
 def start_loopback(req: LoopbackRequest):
     """Start live WASAPI loopback capture mode."""
-    extra = ["--mode", "loopback"]
+    extra = []
 
     if req.show_id:
         show_dir = _resolve_show_path(req.show_id)
@@ -861,7 +861,7 @@ def activate_profile(profile_id: str):
         raise HTTPException(404, f"Profile '{profile_id}' not found")
 
     # Restart loopback with this profile
-    cmd = _get_worker_cmd("music_light.py", ["--mode", "loopback", "--profile", profile_path])
+    cmd = _get_worker_cmd("music_light.py", ["--profile", profile_path])
 
     with _active_lock:
         _kill_active_process()

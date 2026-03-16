@@ -2,10 +2,11 @@
 """
 DMX Light Show — PyInstaller Multi-Entry Spec File
 
-Produces a ONE-FOLDER distribution with three executables:
+Produces a ONE-FOLDER distribution with four executables:
   dist/dmx_app/
     ├── dmx_app.exe              ← Main entry (FastAPI + embedded React UI)
-    ├── music_light_worker.exe   ← DMX engine worker (spawned by dmx_app)
+    ├── music_light_worker.exe   ← Loopback DMX engine worker (spawned by dmx_app)
+    ├── ai_show_player_worker.exe ← AI show synced playback worker (spawned by dmx_app)
     ├── youtube_analyzer_worker.exe ← YouTube + AI analysis worker
     ├── frontend/dist/           ← Pre-built React static files
     ├── profiles/                ← Lighting profiles
@@ -43,6 +44,8 @@ _search_paths = [
     os.path.join('.venv', 'Lib', 'site-packages', 'libusb', '_platform', '_windows', 'x64', 'libusb-1.0.dll'),
     # System-wide
     os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'System32', 'libusb-1.0.dll'),
+    # Logi RightSight (common on machines with Logitech webcam software)
+    os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), 'Logi', 'RightSightForWebcams', 'libusb-1.0.dll'),
     # Local copy
     'libusb-1.0.dll',
 ]
@@ -158,7 +161,28 @@ a_ml = Analysis(
 )
 
 # ---------------------------------------------------------------------------
-# ANALYSIS 3: youtube_analyzer worker
+# ANALYSIS 3: ai_show_player worker (AI-generated show synced playback)
+# ---------------------------------------------------------------------------
+a_ai = Analysis(
+    ['ai_show_player.py'],
+    pathex=['.'],
+    binaries=_shared_binaries,
+    datas=[],
+    hiddenimports=[
+        'usb', 'usb.core', 'usb.backend', 'usb.backend.libusb1',
+        'pyaudiowpatch', 'numpy', 'numpy.core._methods',
+        'bisect',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=['tkinter', 'matplotlib', 'scipy', 'PIL', 'cv2'],
+    noarchive=False,
+    optimize=0,
+)
+
+# ---------------------------------------------------------------------------
+# ANALYSIS 4: youtube_analyzer worker
 # ---------------------------------------------------------------------------
 a_yt = Analysis(
     ['youtube_analyzer.py'],
@@ -187,6 +211,7 @@ a_yt = Analysis(
 MERGE(
     (a_main, 'dmx_app', 'dmx_app'),
     (a_ml, 'music_light_worker', 'music_light_worker'),
+    (a_ai, 'ai_show_player_worker', 'ai_show_player_worker'),
     (a_yt, 'youtube_analyzer_worker', 'youtube_analyzer_worker'),
 )
 
@@ -195,6 +220,7 @@ MERGE(
 # ---------------------------------------------------------------------------
 pyz_main = PYZ(a_main.pure, a_main.zipped_data, cipher=block_cipher)
 pyz_ml = PYZ(a_ml.pure, a_ml.zipped_data, cipher=block_cipher)
+pyz_ai = PYZ(a_ai.pure, a_ai.zipped_data, cipher=block_cipher)
 pyz_yt = PYZ(a_yt.pure, a_yt.zipped_data, cipher=block_cipher)
 
 # ---------------------------------------------------------------------------
@@ -228,6 +254,18 @@ exe_ml = EXE(
     console=True,  # Needs console for logging
 )
 
+exe_ai = EXE(
+    pyz_ai,
+    a_ai.scripts,
+    [],
+    exclude_binaries=True,
+    name='ai_show_player_worker',
+    debug=False,
+    strip=False,
+    upx=True,
+    console=True,  # Needs console for logging
+)
+
 exe_yt = EXE(
     pyz_yt,
     a_yt.scripts,
@@ -252,6 +290,10 @@ coll = COLLECT(
     a_ml.binaries,
     a_ml.zipfiles,
     a_ml.datas,
+    exe_ai,
+    a_ai.binaries,
+    a_ai.zipfiles,
+    a_ai.datas,
     exe_yt,
     a_yt.binaries,
     a_yt.zipfiles,
