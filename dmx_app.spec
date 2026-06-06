@@ -16,7 +16,7 @@ Produces a ONE-FOLDER distribution with four executables:
 The user must place alongside the exe:
     ├── ffmpeg.exe               ← ~200MB, too large to bundle
     ├── yt-dlp.exe               ← ~18MB, frequently updated
-    ├── .env                     ← Azure credentials (user-created)
+    ├── .env                     ← Azure or AWS credentials (user-created)
     └── shows/                   ← Created automatically at runtime
 
 Usage:
@@ -104,6 +104,23 @@ _shared_hiddenimports = [
     'certifi',
     'httpcore',
     'h11',
+    # Amazon Bedrock (boto3) — used by llm_designer when LLM_PROVIDER=bedrock
+    'boto3',
+    'botocore',
+    'botocore.config',
+    'botocore.regions',
+    'botocore.credentials',
+    'botocore.httpsession',
+    'botocore.parsers',
+    'botocore.retryhandler',
+    'botocore.endpoint',
+    'botocore.signers',
+    'botocore.auth',
+    'botocore.hooks',
+    'botocore.loaders',
+    'botocore.serialize',
+    'botocore.utils',
+    's3transfer',
 ]
 
 # ---------------------------------------------------------------------------
@@ -117,6 +134,19 @@ _shared_datas = [
     # Env template so the user knows what to create
     ('.env.example', '.'),
 ]
+
+# Add botocore service model data files for Bedrock support.
+# Only bundle bedrock-runtime (not all ~300 AWS service models) to keep size reasonable.
+try:
+    import botocore as _botocore
+    _botocore_data = os.path.dirname(_botocore.__file__)
+    _shared_datas += [
+        (os.path.join(_botocore_data, 'data', 'bedrock-runtime'), 'botocore/data/bedrock-runtime'),
+        (os.path.join(_botocore_data, 'data', 'endpoints.json'), 'botocore/data/endpoints.json'),
+    ]
+    print(f"[SPEC] Bundling botocore bedrock-runtime data from: {_botocore_data}")
+except ImportError:
+    print("[SPEC] boto3/botocore not installed — Bedrock support will not be available in packaged app.")
 
 # Add libusb DLL as a binary if found
 _shared_binaries = []
@@ -196,6 +226,12 @@ a_yt = Analysis(
         'anyio', 'anyio._backends', 'anyio._backends._asyncio',
         'sniffio', 'certifi', 'httpcore', 'h11',
         'dotenv',
+        # boto3 — needed when LLM_PROVIDER=bedrock (lazy import inside llm_designer)
+        # Listed explicitly here (not just in a_main) so youtube_analyzer_worker.exe
+        # can find them even if built standalone without a_main in scope.
+        'boto3', 'botocore', 'botocore.config', 'botocore.credentials',
+        'botocore.parsers', 'botocore.signers', 'botocore.auth',
+        'botocore.loaders', 'botocore.serialize', 'botocore.utils',
     ],
     hookspath=[],
     hooksconfig={},
