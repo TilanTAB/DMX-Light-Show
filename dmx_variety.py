@@ -44,3 +44,72 @@ PALETTES = [
     {"id": "forest",     "mood": "cool",     "energy": [1, 5],  "primary": [0, 120, 60],   "secondary": [40, 90, 30],   "accent": [150, 255, 180]},
     {"id": "aurora",     "mood": "euphoric", "energy": [2, 6],  "primary": [0, 255, 150],  "secondary": [80, 0, 255],   "accent": [0, 220, 255]},
 ]
+
+
+def _color_distance(a, b):
+    """Euclidean distance between two RGB triples."""
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+def _nearest_palette(candidates, color):
+    """The candidate whose primary is closest to `color`. Deterministic."""
+    return min(candidates, key=lambda p: _color_distance(p["primary"], color))
+
+
+class VarietyEngine:
+    """Owns all anti-monotony policy: palette selection (anti-repeat + per-song
+    seed + optional LLM color seed) and phrase-grid texture evolution.
+    Mode-agnostic — fed via Intent."""
+
+    PHRASE_LEN_BEATS = 8
+    TIME_PHRASE_FALLBACK_S = 4.0
+
+    def __init__(self, palettes=PALETTES, seed=None):
+        self._palettes = list(palettes)
+        self._recent = deque(maxlen=4)          # recent palette ids (anti-repeat)
+        self._rng = random.Random(seed)
+        self.current_palette = self._palettes[0]
+        self.phrase_index = 0
+        self._beats_in_section = 0
+        self._last_t = 0.0
+        self._section_start_t = 0.0
+        self._last_phrase_t = 0.0
+
+    def set_song_seed(self, seed):
+        self._rng = random.Random(seed)
+
+    def begin_section(self, intent):
+        """Pick a fresh palette for a new section and reset phrase state.
+
+        Selection precedence:
+          1. energy range + anti-repeat (always),
+          2. mood match (only when there is no seed_color — color wins over mood),
+          3. if seed_color given -> nearest palette by primary color (deterministic);
+             else -> seeded random choice (per-song identity).
+        Relaxes filters step-by-step if nothing matches, so it never deadlocks."""
+        in_energy = [p for p in self._palettes
+                     if p["energy"][0] <= intent.energy <= p["energy"][1]]
+        fresh = [p for p in in_energy if p["id"] not in self._recent] or in_energy
+
+        if intent.seed_color is None and intent.mood is not None:
+            mood_match = [p for p in fresh if p["mood"] == intent.mood]
+            candidates = mood_match or fresh
+        else:
+            candidates = fresh
+
+        if not candidates:
+            candidates = [p for p in self._palettes if p["id"] not in self._recent] \
+                or list(self._palettes)
+
+        if intent.seed_color is not None:
+            chosen = _nearest_palette(candidates, intent.seed_color)
+        else:
+            chosen = self._rng.choice(candidates)
+
+        self._recent.append(chosen["id"])
+        self.current_palette = chosen
+        self.phrase_index = 0
+        self._beats_in_section = 0
+        self._section_start_t = self._last_t
+        self._last_phrase_t = self._last_t
+        return chosen
