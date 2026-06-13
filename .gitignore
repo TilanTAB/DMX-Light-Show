@@ -77,3 +77,4 @@ test_*.py
 # Allow the real pytest suite (the test_*.py rule above targets throwaway probes)
 !tests/
 !tests/**
+tests/**/__pycache__/
