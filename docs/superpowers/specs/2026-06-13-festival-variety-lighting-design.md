@@ -100,16 +100,15 @@ These replace both the hardcoded R→B→G→W loopback cycle and serve as the c
 
 ### State
 - `recent_palettes` — `deque(maxlen=4)` of recently used family ids → **anti-repeat** (fixes #1).
-- `recent_behaviors` — `deque(maxlen=3)` of recent behaviors → anti-repeat for loopback behavior selection (fixes #1/#4).
 - `song_seed` + `rng` — a seeded RNG so a given song deterministically picks its look (fixes #3).
 - `section_start_beat`, `phrase_index` — intra-section texture tracking (fixes #2).
-- `evolution_clock` — wall-clock drift driver for loopback (fixes #4).
+- section clock (via `tick`'s `seconds_in_section`) — wall-clock drift driver the loopback director reads to force palette rotation (fixes #4).
 
 ### Methods
-- `begin_section(intent)` — on a section/cue boundary: filter the library by `intent.mood` + `intent.energy`, exclude `recent_palettes`, pick via the seeded `rng`, push to `recent_palettes`, reset `phrase_index`. Returns the chosen palette.
-- `on_phrase_boundary()` — advances `phrase_index`; applies one beat-quantized texture move so a section *develops*: rotate the secondary hue, swap the accent, flip color_1/color_2 roles, or arm a one-beat white stab. Quantization is what makes evolution read as *intentional* rather than random.
+- `begin_section(intent)` — on a section/cue boundary: filter the library by `intent.energy` and exclude `recent_palettes`; then **if `intent.seed_color` is set, pick the palette whose primary is nearest that color** (LLM-color-seeds-palette), otherwise filter by `intent.mood` and pick via the seeded `rng`. Push to `recent_palettes`, reset `phrase_index`. Returns the chosen palette. Filters relax step-by-step so it never deadlocks.
+- `on_phrase_boundary()` — advances `phrase_index`; the texture move is derived deterministically from `phrase_index` (swap accent in, flip color_1/color_2 roles, hue-shift the secondary) so a section *develops*. Beat-quantization is what makes evolution read as *intentional* rather than random.
 - `current_colors()` — returns `(color_1, color_2, accent)` for this frame, modulated by `phrase_index`.
-- `tick(beat_frame)` — per frame: track beats, detect phrase boundaries (every N beats from `intent.bpm`), advance `evolution_clock`. For loopback, if energy has been stable > ~16 s, force a palette rotation and permit a behavior change even without an energy transition (fixes #4).
+- `tick(is_beat, bpm, t)` — per frame: track beats, detect phrase boundaries (every 8 beats; time fallback when `bpm` is 0), and return `{phrase_boundary, seconds_in_section}`. The **loopback director** reads `seconds_in_section` and forces `begin_section` after ~16 s at constant energy (fixes #4); the engine reports, the director decides (explicit, not magic).
 
 ### Per-song identity (fix #3)
 - **Synced:** `song_seed = hash(video_id or title + bpm_bucket)`. Same song → same look every time (also makes shows reproducible/debuggable); different songs diverge.
@@ -129,25 +128,30 @@ Intent(
     is_new_section, # True triggers begin_section()
     bpm,            # for phrase detection
     strobe_allowed, # bool
+    seed_color,     # optional [R,G,B] color hint (LLM color_1); None in loopback
 )
 ```
 
-- **Synced director** builds `Intent` from the active LLM cue: `energy_level`, a new optional `mood` field (see Component 5; else mapped from `behavior`), section boundary from cue change, `bpm` from show metadata, `strobe_allowed`.
+- **Synced director** builds `Intent` from the active LLM cue: `energy_level`, optional `mood` (see Component 5), section boundary from cue change, `bpm` from show metadata, `strobe_allowed`, and `seed_color = cue["color_1"]` so the LLM's color choice seeds the palette family.
 - **Loopback director** builds `Intent` from the energy state machine: `energy_state` → energy number, `mood` inferred deterministically from the energy band (e.g. low→`warm`, mid→`cool`, high→`neon`, peak→`euphoric`), "section" = energy-state transition, `bpm` from detected BPS.
 
 ---
 
 ## Component 4 — Renderer changes (parameter-driven + shared punch)
 
-Renderers stop hardcoding colors and instead read `VarietyEngine.current_colors()` plus a shared `RenderContext` carrying the punch primitives. The punch logic currently exclusive to `_render_loopback_direct()` — velocity → brightness (120–255), 4–5 frame beat-hold, warm afterglow decay (R 95% / G 88% / B 82%), breathing white floor — is lifted into a shared helper that **both** modes use.
+Renderers stop hardcoding colors and instead read `VarietyEngine.current_colors()`. The punch logic currently exclusive to `_render_loopback_direct()` — velocity → brightness (120–255), 4–5 frame beat-hold, warm afterglow decay (R 95% / G 88% / B 82%), breathing white floor — is lifted into shared pure functions (`velocity_brightness`, `afterglow` in `dmx_punch.py`) that **both** modes use.
 
-Result: synced mode finally gets punch, every renderer gets variety colors, and because variety touches only color/texture while punch governs beat response, the two never fight. The known "synced is mushy" complaint is fixed by the same change that adds variety.
+Critically, `_render_loopback_direct()` itself currently ignores the colors passed to it and sets channels from a `color_idx` (the hardcoded R→B→G→W cycle). It is **rewired to consume the palette's `(color_1, color_2, accent)`** — without this, palette variety never reaches loopback's punchy path and pain point #1 survives. The standalone `color_phase` cycling is then dead and removed.
+
+Result: synced mode finally gets punch, both modes get variety colors (including the loopback punchy path), and because variety touches only color/texture while punch governs beat response, the two never fight. The known "synced is mushy" complaint is fixed by the same change that adds variety.
 
 ---
 
 ## Component 5 — LLM schema / prompt enrichment (`llm_designer.py`)
 
-Additive, backward-compatible. Add an optional **`mood`** field per cue to the `REQUIRED JSON FORMAT`, and a prompt instruction to assign a mood per section that *contrasts with neighbors*. The synced director maps cue `mood` → `Intent.mood`; if the LLM omits it (older shows, malformed output), the director infers mood from `energy_level` so nothing breaks. The existing `_validate_and_repair_plan` gains a default-mood repair. The LLM thus contributes taste, but the VarietyEngine still owns anti-repeat and intra-section timing.
+Additive, backward-compatible. Add an optional **`mood`** field per cue to the `REQUIRED JSON FORMAT`, and a prompt instruction to assign a mood per section that *contrasts with neighbors*. The synced director maps cue `mood` → `Intent.mood`; if the LLM omits it, `_validate_and_repair_plan` defaults it from `energy_level` so nothing breaks.
+
+**Color ownership (decided): the LLM's `color_1` *seeds* the palette rather than being used directly.** The synced director passes `seed_color = cue["color_1"]` and `begin_section` maps it to the nearest curated palette family, after which texture evolution + anti-repeat take over. This honors the LLM's design intent while still guaranteeing variety and anti-repetition — the original cue colors are no longer painted verbatim. The prompt's heavy "COLOR RULES" section can therefore be trimmed to a brief "pick an evocative `color_1` per section; it seeds the palette" hint. The LLM contributes taste (color intent + mood + contrast); the VarietyEngine owns final color, anti-repeat, and intra-section timing.
 
 ---
 
@@ -156,7 +160,7 @@ Additive, backward-compatible. Add an optional **`mood`** field per cue to the `
 1. `process_audio()` decodes audio, runs FFT/bands/AGC/flux, detects beats → `BeatFrame`.
 2. Subclass `_dispatch(beat_frame)` builds `Intent`. If `is_new_section`, calls `VarietyEngine.begin_section(intent)`.
 3. `VarietyEngine.tick(beat_frame)` advances phrase/evolution state; on a phrase boundary it applies a texture move.
-4. The chosen renderer reads `current_colors()` + `RenderContext` (velocity, beat-hold, afterglow) and computes the 8-byte frame.
+4. The chosen renderer reads `current_colors()` and applies the shared punch functions (`velocity_brightness`, `afterglow`) to compute the 8-byte frame.
 5. `send_dmx()` queues the frame for the USB worker thread.
 
 ---

@@ -36,14 +36,16 @@ Introducing `pytest` is a deliberate, additive choice (CLAUDE.md notes the repo 
 | `tests/test_intent.py` | unit tests for `Intent` | **new** |
 | `tests/test_palettes.py` | unit tests for the palette library shape | **new** |
 | `tests/test_variety_engine.py` | unit tests for `VarietyEngine` | **new** |
-| `tests/test_punch.py` | unit tests for `apply_punch()` | **new** |
+| `tests/test_punch.py` | unit tests for the punch helpers | **new** |
 | `tests/test_llm_repair.py` | unit test for the mood-default repair | **new** |
 
 **Naming locked across tasks** (use these exact names everywhere):
-- `Intent` fields: `energy:int`, `mood:str`, `section_id`, `is_new_section:bool`, `bpm:float`, `strobe_allowed:bool`.
+- `Intent` fields: `energy:int`, `mood:str`, `section_id`, `is_new_section:bool`, `bpm:float`, `strobe_allowed:bool`, `seed_color` (optional `[R,G,B]` color hint from the LLM; `None` in loopback).
 - Palette family dict keys: `id`, `mood`, `energy` (`[lo, hi]`), `primary`, `secondary`, `accent` (each color `[R,G,B]`).
-- `VarietyEngine` methods: `set_song_seed(seed)`, `begin_section(intent)`, `on_phrase_boundary()`, `current_colors()`, `tick(is_beat, bpm, t)`.
+- `VarietyEngine` methods: `set_song_seed(seed)`, `begin_section(intent)`, `on_phrase_boundary()`, `current_colors()`, `tick(is_beat, bpm, t)`. Module helpers: `_color_distance(a, b)`, `_nearest_palette(candidates, color)`.
 - `dmx_punch.py` functions: `velocity_brightness(beat_velocity)` → master 120..255; `afterglow(r, g, b, w)` → warm-shifted decayed tuple.
+
+**Color ownership (decided):** in synced mode the LLM's `color_1` **seeds** the palette — `begin_section` maps it to the nearest curated family, then the engine evolves from there. The LLM no longer owns final colors; it expresses intent via `color_1` + `mood`. Loopback has no LLM color, so it selects purely by energy/mood/anti-repeat.
 
 ---
 
@@ -67,9 +69,21 @@ testpaths = tests
 python_files = test_*.py
 ```
 
-- [ ] **Step 3: Create `tests/__init__.py`** (empty file)
+- [ ] **Step 3: Un-ignore the `tests/` dir**
 
-- [ ] **Step 4: Write a smoke test**
+The repo's `.gitignore` has `test_*.py`, which matches `tests/test_intent.py` by basename — without this, every test file in this plan is silently skipped by `git add`. Add a negation **after** that rule (order matters in gitignore):
+
+```gitignore
+# Allow the real test suite (the test_*.py rule above targets throwaway probes)
+!tests/
+!tests/**
+```
+
+After this, plain `git add tests/...` works in every later task — no `-f` needed.
+
+- [ ] **Step 4: Create `tests/__init__.py`** (empty file)
+
+- [ ] **Step 5: Write a smoke test**
 
 `tests/test_smoke.py`:
 ```python
@@ -77,19 +91,18 @@ def test_pytest_runs():
     assert 1 + 1 == 2
 ```
 
-- [ ] **Step 5: Run it**
+- [ ] **Step 6: Run it**
 
 Run: `.venv\Scripts\python -m pytest -q`
 Expected: `1 passed`
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add tests/__init__.py tests/test_smoke.py pytest.ini
+git add .gitignore pytest.ini tests/__init__.py tests/test_smoke.py
+git status   # confirm tests/test_smoke.py is staged (not ignored)
 git commit -m "test: add pytest scaffolding for new pure-logic modules"
 ```
-
-> Note: `tests/test_*.py` matches the `.gitignore` rule `test_*.py`. The files above live in `tests/` and must be force-added. If `git add` ignores them, use `git add -f tests/`. Confirm they are tracked with `git status` before committing.
 
 ---
 
@@ -130,6 +143,8 @@ Add the abstract method to `DmxEngineBase`:
 ```
 
 > The exact slice of `process_audio` that moves to `_dispatch` is the per-mode tail. Keep everything above it (decode → FFT → bands → AGC → flux → indices → beat detection → BPS) in the base `process_audio`. Do not change any numbers.
+>
+> **One required addition (not a behavior change):** the BPS value `process_audio` computes is currently a local. Store it as `self.beats_per_sec` right where it's computed, so `_dispatch` can read it explicitly instead of guessing. (Loopback reads this; synced uses `self.show_bpm` instead — see Task 10.)
 
 - [ ] **Step 2: Reduce `music_light.py` to a subclass**
 
@@ -326,6 +341,11 @@ def test_intent_defaults():
     assert i.is_new_section is False
     assert i.bpm == 0.0
     assert i.strobe_allowed is False
+    assert i.seed_color is None
+
+def test_intent_carries_seed_color():
+    i = Intent(energy=8, mood="neon", section_id="drop", seed_color=[255, 0, 120])
+    assert i.seed_color == [255, 0, 120]
 ```
 
 - [ ] **Step 2: Run, verify it fails**
@@ -349,22 +369,24 @@ from collections import deque
 class Intent:
     """Normalized lighting intent emitted by either director."""
     __slots__ = ("energy", "mood", "section_id", "is_new_section",
-                 "bpm", "strobe_allowed")
+                 "bpm", "strobe_allowed", "seed_color")
 
     def __init__(self, energy, mood, section_id,
-                 is_new_section=False, bpm=0.0, strobe_allowed=False):
+                 is_new_section=False, bpm=0.0, strobe_allowed=False,
+                 seed_color=None):
         self.energy = energy
         self.mood = mood
         self.section_id = section_id
         self.is_new_section = is_new_section
         self.bpm = bpm
         self.strobe_allowed = strobe_allowed
+        self.seed_color = seed_color  # optional [R,G,B] hint (LLM color_1); None in loopback
 ```
 
 - [ ] **Step 4: Run, verify it passes**
 
 Run: `.venv\Scripts\python -m pytest tests/test_intent.py -q`
-Expected: `2 passed`
+Expected: `3 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -496,14 +518,27 @@ def test_seeding_is_deterministic():
     seq_b = [b.begin_section(_intent())["id"] for _ in range(6)]
     assert seq_a == seq_b
 
-def test_different_seeds_diverge():
-    a = [VarietyEngine(seed=1).begin_section(_intent())["id"] for _ in range(1)]
-    b = [VarietyEngine(seed=2).begin_section(_intent())["id"] for _ in range(1)]
-    # not a hard guarantee per-call, but across a short run they should differ
-    seq_a = VarietyEngine(seed=1); seq_b = VarietyEngine(seed=2)
-    ra = [seq_a.begin_section(_intent())["id"] for _ in range(6)]
-    rb = [seq_b.begin_section(_intent())["id"] for _ in range(6)]
-    assert ra != rb
+def test_different_seeds_can_diverge():
+    # Deterministic per seed; across a 6-section run two seeds should differ.
+    # (Not a per-call guarantee, but with 16 palettes + anti-repeat this run
+    #  is stable — asserted on the whole sequence, not a single pick.)
+    ra = [VarietyEngine(seed=1).begin_section(_intent())["id"] for _ in range(1)]
+    seq_a = VarietyEngine(seed=1)
+    seq_b = VarietyEngine(seed=2)
+    run_a = [seq_a.begin_section(_intent())["id"] for _ in range(6)]
+    run_b = [seq_b.begin_section(_intent())["id"] for _ in range(6)]
+    assert run_a != run_b
+
+def test_seed_color_picks_nearest_family():
+    # An intent carrying a magenta-ish seed_color should land on a neon/pink
+    # family whose primary is close to it, deterministically (no rng).
+    ve = VarietyEngine(seed=999)
+    p = ve.begin_section(_intent(energy=8, mood=None))  # warm up recent buffer
+    chosen = ve.begin_section(Intent(energy=8, mood=None, section_id="x",
+                                     is_new_section=True, bpm=128.0,
+                                     seed_color=[255, 0, 120]))
+    # nearest primary to [255,0,120] among energy-8 candidates is neon_pink
+    assert chosen["id"] == "neon_pink"
 
 def test_relax_when_library_exhausted():
     tiny = PALETTES[:2]
@@ -513,6 +548,8 @@ def test_relax_when_library_exhausted():
     assert len(ids) == 5
 ```
 
+> If `neon_pink` happens to be in the recent buffer when the seed-color test runs, anti-repeat would exclude it. The test warms up with a single prior selection at `seed=999`; if this proves flaky during implementation, assert instead that the chosen primary is within distance 60 of `[255,0,120]` rather than a fixed id.
+
 - [ ] **Step 2: Run, verify it fails**
 
 Run: `.venv\Scripts\python -m pytest tests/test_variety_engine.py -q`
@@ -520,11 +557,22 @@ Expected: FAIL (`ImportError: VarietyEngine`).
 
 - [ ] **Step 3: Implement selection**
 
-Append to `dmx_variety.py`:
+Append to `dmx_variety.py` (the two module helpers go near the top with `_shift_hue`; the class follows):
 ```python
+def _color_distance(a, b):
+    """Euclidean distance between two RGB triples."""
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+def _nearest_palette(candidates, color):
+    """The candidate whose primary is closest to `color`. Deterministic."""
+    return min(candidates, key=lambda p: _color_distance(p["primary"], color))
+
+
 class VarietyEngine:
     """Owns all anti-monotony policy: palette selection (anti-repeat + per-song
-    seed) and phrase-grid texture evolution. Mode-agnostic — fed via Intent."""
+    seed + optional LLM color seed) and phrase-grid texture evolution.
+    Mode-agnostic — fed via Intent."""
 
     PHRASE_LEN_BEATS = 8
     TIME_PHRASE_FALLBACK_S = 4.0
@@ -532,7 +580,6 @@ class VarietyEngine:
     def __init__(self, palettes=PALETTES, seed=None):
         self._palettes = list(palettes)
         self._recent = deque(maxlen=4)          # recent palette ids (anti-repeat)
-        self.recent_behaviors = deque(maxlen=3) # for loopback behavior anti-repeat
         self._rng = random.Random(seed)
         self.current_palette = self._palettes[0]
         self.phrase_index = 0
@@ -545,24 +592,33 @@ class VarietyEngine:
         self._rng = random.Random(seed)
 
     def begin_section(self, intent):
-        """Pick a fresh palette for a new section and reset phrase state."""
-        candidates = [
-            p for p in self._palettes
-            if p["id"] not in self._recent
-            and p["energy"][0] <= intent.energy <= p["energy"][1]
-            and (intent.mood is None or p["mood"] == intent.mood)
-        ]
-        if not candidates:
-            # Relax mood first, then anti-repeat, then everything.
-            candidates = [p for p in self._palettes
-                          if p["id"] not in self._recent
-                          and p["energy"][0] <= intent.energy <= p["energy"][1]]
-        if not candidates:
-            candidates = [p for p in self._palettes if p["id"] not in self._recent]
-        if not candidates:
-            candidates = list(self._palettes)
+        """Pick a fresh palette for a new section and reset phrase state.
 
-        chosen = self._rng.choice(candidates)
+        Selection precedence:
+          1. energy range + anti-repeat (always),
+          2. mood match (only when there is no seed_color — color wins over mood),
+          3. if seed_color given → nearest palette by primary color (deterministic);
+             else → seeded random choice (per-song identity).
+        Relaxes filters step-by-step if nothing matches, so it never deadlocks."""
+        in_energy = [p for p in self._palettes
+                     if p["energy"][0] <= intent.energy <= p["energy"][1]]
+        fresh = [p for p in in_energy if p["id"] not in self._recent] or in_energy
+
+        if intent.seed_color is None and intent.mood is not None:
+            mood_match = [p for p in fresh if p["mood"] == intent.mood]
+            candidates = mood_match or fresh
+        else:
+            candidates = fresh
+
+        if not candidates:
+            candidates = [p for p in self._palettes if p["id"] not in self._recent] \
+                or list(self._palettes)
+
+        if intent.seed_color is not None:
+            chosen = _nearest_palette(candidates, intent.seed_color)
+        else:
+            chosen = self._rng.choice(candidates)
+
         self._recent.append(chosen["id"])
         self.current_palette = chosen
         self.phrase_index = 0
@@ -575,7 +631,7 @@ class VarietyEngine:
 - [ ] **Step 4: Run, verify it passes**
 
 Run: `.venv\Scripts\python -m pytest tests/test_variety_engine.py -q`
-Expected: `6 passed`
+Expected: `7 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -667,7 +723,7 @@ def _shift_hue(rgb, degrees):
 - [ ] **Step 4: Run, verify it passes**
 
 Run: `.venv\Scripts\python -m pytest tests/test_variety_engine.py -q`
-Expected: `8 passed`
+Expected: `9 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -750,7 +806,7 @@ Add to `VarietyEngine`:
 - [ ] **Step 4: Run, verify it passes**
 
 Run: `.venv\Scripts\python -m pytest tests/test_variety_engine.py -q`
-Expected: `10 passed`
+Expected: `11 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -770,58 +826,72 @@ Build `Intent` in each `_dispatch`, drive the engine, log decisions via dry-run 
 - Modify: `music_light.py` (loopback director builds Intent)
 - Modify: `ai_show_player.py` (synced director builds Intent)
 
-- [ ] **Step 1: Construct the engine in the base**
+- [ ] **Step 1: Construct the engine and wire the per-song seed**
 
 In `DmxEngineBase.__init__`, after existing state setup:
 ```python
         from dmx_variety import VarietyEngine
         self.variety = VarietyEngine()
         self._last_section_id = None
+        self.show_bpm = 0.0          # set by load_ai_show (synced)
+        self.beats_per_sec = 0.0     # set by process_audio (loopback); see Task 2
+        self._evolution_secs = 16.0  # loopback: rotate palette after this long at one energy
 ```
 
-- [ ] **Step 2: Loopback director builds Intent and drives the engine**
+In `DmxEngineBase.load_ai_show`, after the show dict is parsed, set the BPM and **seed the engine from the song's identity** so the same show always renders the same look (fixes "every song looks alike"):
+```python
+        metrics = show.get("lighting_plan", {}).get("song_metrics", {}) \
+            or show.get("song_metrics", {})
+        self.show_bpm = float(metrics.get("bpm", 0.0) or 0.0)
+        seed_basis = show.get("show_name") or show.get("audio_file") or ""
+        self.variety.set_song_seed(hash(seed_basis))
+```
+> Adjust the exact dict path to wherever `load_ai_show` already reads the plan — the point is a stable per-show seed (name or audio path) and the real BPM. If neither exists, `hash("")` is a stable fallback.
 
-In `music_light.py` `_dispatch`, before the existing color/behavior block:
+- [ ] **Step 2: Loopback director — Intent + time-evolution**
+
+In `music_light.py` `_dispatch`, before the existing color/behavior block. Note: `tick` is called **first** so `seconds_in_section` is current; a new palette is forced either on an energy-state change **or** after `_evolution_secs` at constant energy (this is what fixes "loopback feels static"):
 ```python
         from dmx_variety import Intent
-        beats_per_sec = getattr(self, "beats_per_sec", 0.0)
-        bpm = beats_per_sec * 60.0
+        bpm = self.beats_per_sec * 60.0   # explicit attr set in process_audio (Task 2)
         mood = {"calm": "warm", "building": "cool",
                 "high": "neon", "dropping": "euphoric"}.get(self.energy_state, "cool")
         energy = {"calm": 2, "building": 5, "high": 8, "dropping": 6}.get(self.energy_state, 5)
         section_id = self.energy_state
-        is_new = section_id != self._last_section_id
+
+        ev = self.variety.tick(is_beat=(is_kick or is_snare), bpm=bpm, t=t)
+        force_evolve = ev["seconds_in_section"] >= self._evolution_secs
+        is_new = (section_id != self._last_section_id) or force_evolve
         self._last_section_id = section_id
-        intent = Intent(energy=energy, mood=mood, section_id=section_id,
-                        is_new_section=is_new, bpm=bpm, strobe_allowed=True)
         if is_new:
-            self.variety.begin_section(intent)
-        self.variety.tick(is_beat=(is_kick or is_snare), bpm=bpm, t=t)
+            intent = Intent(energy=energy, mood=mood, section_id=section_id,
+                            is_new_section=True, bpm=bpm, strobe_allowed=True)
+            self.variety.begin_section(intent)   # resets section clock → evolution re-arms
 ```
 
-- [ ] **Step 3: Synced director builds Intent and drives the engine**
+- [ ] **Step 3: Synced director — Intent + LLM color seed**
 
-In `ai_show_player.py` `_dispatch`, after resolving `cue`/`behavior`:
+In `ai_show_player.py` `_dispatch`, after resolving `cue`/`behavior`. The LLM's `color_1` becomes the palette **seed_color** (decided: LLM color seeds the palette):
 ```python
         from dmx_variety import Intent
         if cue:
             energy = int(cue.get("energy_level", cue.get("energy", 5)))
-            mood = cue.get("mood")  # may be None until Task 13
+            mood = cue.get("mood")            # None until Task 13; fine
             section_id = cue.get("name", "")
             strobe = bool(cue.get("strobe_allowed", False))
+            seed_color = cue.get("color_1")   # LLM intent → nearest palette family
         else:
-            energy, mood, section_id, strobe = 7, None, "_fallback", False
-        bpm = float(getattr(self, "show_bpm", 0.0))
+            energy, mood, section_id, strobe, seed_color = 7, None, "_fallback", False, None
+        bpm = self.show_bpm                    # explicit attr set in load_ai_show
         is_new = section_id != self._last_section_id
         self._last_section_id = section_id
-        intent = Intent(energy=energy, mood=mood, section_id=section_id,
-                        is_new_section=is_new, bpm=bpm, strobe_allowed=strobe)
+        ev = self.variety.tick(is_beat=(is_kick or is_snare), bpm=bpm, t=t)
         if is_new:
+            intent = Intent(energy=energy, mood=mood, section_id=section_id,
+                            is_new_section=True, bpm=bpm, strobe_allowed=strobe,
+                            seed_color=seed_color)
             self.variety.begin_section(intent)
-        self.variety.tick(is_beat=(is_kick or is_snare), bpm=bpm, t=t)
 ```
-
-> If `self.show_bpm` does not already exist, set it in `load_ai_show` from the show's `song_metrics.bpm` (default `0.0`). Phrase detection falls back to time if BPM is unknown.
 
 - [ ] **Step 4: Verify via dry-run (decisions logged, no behavior change)**
 
@@ -935,13 +1005,60 @@ The payoff. Renderers stop using the cue/cycle colors and read `self.variety.cur
 
 - [ ] **Step 1: Source colors from the variety engine in both directors**
 
-In `music_light.py` `_dispatch`, replace the local `kick_color`/`accent_color` assignment with:
+In `music_light.py` `_dispatch`, replace the local color assignment with the palette's three colors, and pass them to the renderers:
 ```python
         kick_color, accent_color, combo_color = self.variety.current_colors()
 ```
-In `ai_show_player.py` `_dispatch`, same replacement (drop the `cue["color_1"]`/`palettes[...]` sourcing for color; the cue still drives `behavior`, `energy`, `strobe`). Keep passing `kick_color, accent_color` into the renderer call.
+- Ambient branch: call the standard renderer with `kick_color, accent_color` (as today).
+- Punchy branch: call the rewired loopback renderer with the new signature (Step 2):
+```python
+            self._render_loopback_direct(
+                kick_mag, snare_mag, mid_mag, hihat_mag,
+                kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                kick_color, accent_color, combo_color, volume, t)
+```
 
-- [ ] **Step 2: Add punch to the synced beat path**
+In `ai_show_player.py` `_dispatch`, replace the cue/`palettes[...]` color sourcing with `kick_color, accent_color, combo_color = self.variety.current_colors()`. The cue still drives `behavior`, `energy`, `strobe`, and `seed_color` (Task 10). Keep passing `kick_color, accent_color` into the renderer call.
+
+- [ ] **Step 2: Rewire `_render_loopback_direct` to use palette colors (fixes the R→B→G→W repetition)**
+
+This is the core loopback fix. The current renderer ignores the colors passed in and sets channels from `color_idx` (`music_light.py:858-861`), so palette variety never reaches the punchy path. Change its signature from `(..., color_1, color_2, volume, t, color_idx=0)` to `(..., color_1, color_2, accent, volume, t)` and replace the three `color_idx`-driven blocks in `dmx_engine.py`:
+
+```python
+    # ── DEEP BASS COMBO: accent blast ──
+    if (is_kick or is_snare) and is_deep_bass:
+        self.out_r, self.out_g, self.out_b = accent
+        self.out_w = 255.0
+        self.out_master = vb                 # vb = velocity_brightness(beat_velocity), Task 11
+        self.out_strobe = 0
+        self.beat_hold_frames = self.profile_deep_bass_hold
+        return
+
+    # ── NORMAL BEAT: palette color snap, white punch on kick ──
+    if is_kick or is_snare:
+        col = color_1 if is_kick else color_2
+        self.out_r, self.out_g, self.out_b = col
+        self.out_w = 255.0 if is_kick else 0.0
+        self.out_master = vb
+        self.out_strobe = 0
+        self.beat_hold_frames = self.profile_beat_hold
+        return
+```
+And the between-beats glow block (replacing the `color_idx` glow at `music_light.py:885-899`):
+```python
+        if bass_active:
+            glow = (bass - self.profile_glow_thresh) * 0.4
+            self.out_r, self.out_g, self.out_b = (c * glow for c in color_1)
+            self.out_w = 0.0
+            self.out_master = max(15, glow * 180)
+        else:
+            self.out_r, self.out_g, self.out_b, self.out_w = afterglow(
+                self.out_r, self.out_g, self.out_b, self.out_w)
+            self.out_master *= self.profile_decay_speed
+```
+> Keep the breathing-white-floor tail (`music_light.py:901-904`) unchanged. The loopback color-cycling helpers and `self.color_phase` are now dead — remove the `color_phase` increment from the loopback `_dispatch`; palette + phrase evolution replaces it.
+
+- [ ] **Step 3: Add punch to the synced beat path**
 
 In `dmx_engine.py`, in `_render_beat_reactive` and `_render_bass_white_blast` (the high-energy synced renderers), set master from velocity and apply afterglow on the non-beat frames, mirroring `_render_loopback_direct`:
 ```python
@@ -958,23 +1075,23 @@ In `dmx_engine.py`, in `_render_beat_reactive` and `_render_bass_white_blast` (t
 ```
 > Apply only to the punchy renderers. Ambient renderers (`ocean_drift`, `candlelight`, `sunset_fade`, `aurora_shimmer`, `slow_breathe`, `static_wash`) must NOT get beat-hold — they are intentionally smooth.
 
-- [ ] **Step 3: Verify variety + punch via dry-run**
+- [ ] **Step 4: Verify variety + punch via dry-run**
 
 Run: `set DMX_DRY_RUN=1 && .venv\Scripts\python ai_show_player.py --show shows/<id>/show.json`
 Expected: within a single long cue, logged `frame=` colors **change across phrase boundaries** (texture evolution), and beat frames show master near 255 while off-beats decay (punch).
 
-- [ ] **Step 4: Live verification — the real test**
+- [ ] **Step 5: Live verification — the real test**
 
 Run a synced show and loopback on hardware.
-Expected: synced now has punch (crisp beats, not mushy); both modes show evolving palettes within sections and fresh palettes across sections. A/B by ear against the pre-change loopback to confirm punch did not regress.
+Expected: loopback no longer cycles a fixed R→B→G→W — colors come from evolving palettes; synced now has punch (crisp beats, not mushy); both modes show evolving palettes within sections and fresh palettes across sections. A/B by ear against the pre-change loopback to confirm punch did not regress.
 
-- [ ] **Step 5: Remove the temporary `[VARIETY]` debug log from Task 10 Step 4.**
+- [ ] **Step 6: Remove the temporary `[VARIETY]` debug log from Task 10 Step 4.**
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add dmx_engine.py music_light.py ai_show_player.py
-git commit -m "feat: renderers consume VarietyEngine colors and shared punch"
+git commit -m "feat: renderers consume VarietyEngine palette colors and shared punch"
 ```
 
 ---
@@ -1041,7 +1158,7 @@ In the `=== REQUIRED JSON FORMAT ===` block of the prompt, add `"mood": "warm|co
 - [ ] **Step 6: Run the full suite**
 
 Run: `.venv\Scripts\python -m pytest -q`
-Expected: all tests pass (`Intent`, palettes, variety engine x10, punch x3, repair, smoke).
+Expected: all tests pass across the suite (`test_intent`, `test_palettes`, `test_variety_engine`, `test_punch`, `test_llm_repair`, `test_smoke`).
 
 - [ ] **Step 7: End-to-end verification**
 
@@ -1059,18 +1176,35 @@ git commit -m "feat: LLM assigns per-cue mood; repair defaults from energy"
 
 ## Self-review notes (coverage map)
 
-| Spec section | Task(s) |
+| Goal / spec section | Where it's actually implemented |
 |---|---|
 | Shared-module extraction | 2, 3 |
 | VarietyEngine: palettes | 6 |
-| VarietyEngine: anti-repeat + per-song seed (#1, #3) | 7 |
-| VarietyEngine: intra-section texture (#2) | 8, 9, 12 |
-| VarietyEngine: loopback evolution (#4) | 9, 10 |
-| Intent contract | 5, 10 |
+| Colors repeat (#1) — loopback | **Task 12 Step 2** (rewire `_render_loopback_direct` to palette colors) + anti-repeat (7) |
+| Colors repeat (#1) — synced | 7 (anti-repeat) + 12 Step 1 (renderer reads palette) |
+| Same texture all section (#2) | 8 (phase), 9 (tick), 12 (renderer reads `current_colors`) |
+| Every song looks alike (#3) | 7 (seed mechanism) + **Task 10 Step 1** (`set_song_seed` actually called from show identity) |
+| Loopback feels static (#4) | **Task 10 Step 2** (`seconds_in_section` ≥ 16 s forces a new palette) |
+| Intent contract (+ `seed_color`) | 5, 10 |
+| LLM color seeds palette (decision) | 7 (`_nearest_palette`) + 10 Step 3 (`seed_color=cue["color_1"]`) |
 | Renderer changes + shared punch | 11, 12 |
 | LLM mood enrichment | 13 |
-| Error handling (relax, mood fallback, bpm fallback) | 7, 9, 13 |
+| Explicit BPM (no silent fallback) | 2 (`self.beats_per_sec`), 10 Step 1 (`self.show_bpm`) |
+| Error handling (relax, mood/bpm fallback) | 7, 9, 13 |
 | Testing / dry-run harness | 1, 4 |
 | Invariants preserved (USB dispose, WASAPI terminate, watchdog) | 2, 3 (verbatim) |
 
-**Open follow-ups (not in scope):** per-song seed for loopback (no track boundaries); a loopback dry-run harness (needs live audio); extracting the remaining loopback color-cycling once VarietyEngine fully owns color.
+**Open follow-ups (not in scope):** per-song seed for loopback (no track boundaries — loopback uses time-evolution instead); a loopback dry-run harness (needs live audio).
+
+---
+
+## Amendments applied (2026-06-13 self-review pass)
+
+This plan was revised after a self-review caught gaps where the original would not have delivered the goals:
+1. **`_render_loopback_direct` rewired to palette colors** (Task 12 Step 2) — without this, loopback's hardcoded R→B→G→W survived and pain point #1 was unfixed on the punchy path.
+2. **`set_song_seed` is now actually called** (Task 10 Step 1) — per-song identity (#3) was previously implemented but never invoked.
+3. **Loopback time-evolution wired** (Task 10 Step 2) — `seconds_in_section` now forces palette rotation at constant energy, fixing #4 (was reported by `tick` but unused).
+4. **LLM color seeds the palette** (Tasks 5/7/10) — `Intent.seed_color` + `_nearest_palette` resolve the contradiction of discarding LLM colors while still asking for them.
+5. **`.gitignore` `!tests/` negation** (Task 1) — test files would otherwise be silently skipped by `git add`.
+6. **Explicit `self.beats_per_sec` / `self.show_bpm`** (Tasks 2/10) — replaced silent `getattr(..., 0.0)` fallbacks that would have disabled beat-grid phrasing without warning.
+7. **Removed dead `recent_behaviors`; rewrote the flaky `test_different_seeds_diverge`** (Task 7).
