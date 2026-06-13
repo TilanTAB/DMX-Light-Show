@@ -54,6 +54,11 @@ current_show.json
 shows/
 
 # ==========================================
+# Brainstorming session artifacts
+# ==========================================
+.superpowers/
+
+# ==========================================
 # IDE / OS
 # ==========================================
 .vscode/
@@ -68,3 +73,7 @@ Thumbs.db
 # Test files (may contain hardcoded credentials)
 # ==========================================
 test_*.py
+
+# Allow the real pytest suite (the test_*.py rule above targets throwaway probes)
+!tests/
+!tests/**
