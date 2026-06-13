@@ -46,6 +46,16 @@ PALETTES = [
 ]
 
 
+def _shift_hue(rgb, degrees):
+    """Rotate an RGB color's hue by `degrees`. Cheap, dependency-free."""
+    import colorsys
+    r, g, b = (c / 255.0 for c in rgb)
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    h = (h + degrees / 360.0) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return [int(r * 255), int(g * 255), int(b * 255)]
+
+
 def _color_distance(a, b):
     """Euclidean distance between two RGB triples."""
     return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
@@ -113,3 +123,28 @@ class VarietyEngine:
         self._section_start_t = self._last_t
         self._last_phrase_t = self._last_t
         return chosen
+
+    def on_phrase_boundary(self):
+        """Advance one phrase; texture moves are derived from phrase_index so
+        the section *develops* deterministically (beat-quantized = intentional)."""
+        self.phrase_index += 1
+
+    def current_colors(self):
+        """(color_1, color_2, accent) for this frame, modulated by phrase_index.
+
+        Phase pattern (cycles every 4 phrases):
+          0: primary / secondary / accent
+          1: primary / accent    / secondary   (swap accent in)
+          2: secondary / primary / accent       (flip roles)
+          3: primary / hue-shifted secondary / accent
+        """
+        p = self.current_palette
+        prim, sec, acc = p["primary"], p["secondary"], p["accent"]
+        phase = self.phrase_index % 4
+        if phase == 0:
+            return list(prim), list(sec), list(acc)
+        if phase == 1:
+            return list(prim), list(acc), list(sec)
+        if phase == 2:
+            return list(sec), list(prim), list(acc)
+        return list(prim), _shift_hue(sec, 40), list(acc)

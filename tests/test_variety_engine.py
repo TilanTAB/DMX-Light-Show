@@ -62,3 +62,24 @@ def test_relax_when_library_exhausted():
     # more selections than the library size must not crash
     ids = [ve.begin_section(_intent(energy=tiny[0]["energy"][0]))["id"] for _ in range(5)]
     assert len(ids) == 5
+
+
+def test_current_colors_returns_three_rgb():
+    ve = VarietyEngine(seed=1)
+    ve.begin_section(_intent(energy=8, mood="neon"))
+    c1, c2, accent = ve.current_colors()
+    for c in (c1, c2, accent):
+        assert len(c) == 3 and all(0 <= v <= 255 for v in c)
+
+
+def test_texture_evolves_across_phrases():
+    ve = VarietyEngine(seed=1)
+    ve.begin_section(_intent(energy=8, mood="neon"))
+    look0 = ve.current_colors()
+    ve.on_phrase_boundary()
+    look1 = ve.current_colors()
+    ve.on_phrase_boundary()
+    look2 = ve.current_colors()
+    # at least one of the first three phrases differs from phrase 0
+    assert look1 != look0 or look2 != look0
+    assert ve.phrase_index == 2
