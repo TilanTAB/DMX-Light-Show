@@ -148,3 +148,27 @@ class VarietyEngine:
         if phase == 2:
             return list(sec), list(prim), list(acc)
         return list(prim), _shift_hue(sec, 40), list(acc)
+
+    def tick(self, is_beat, bpm, t):
+        """Per-frame update. Returns {'phrase_boundary': bool,
+        'seconds_in_section': float}. Directors call this every frame and read
+        current_colors(); they decide when to call begin_section()."""
+        self._last_t = t
+        boundary = False
+
+        if bpm and bpm > 0:
+            if is_beat:
+                self._beats_in_section += 1
+                if self._beats_in_section % self.PHRASE_LEN_BEATS == 0:
+                    self.on_phrase_boundary()
+                    boundary = True
+                    self._last_phrase_t = t
+        else:
+            # No reliable beat grid -> fall back to a wall-clock phrase interval.
+            if t - self._last_phrase_t >= self.TIME_PHRASE_FALLBACK_S:
+                self.on_phrase_boundary()
+                boundary = True
+                self._last_phrase_t = t
+
+        return {"phrase_boundary": boundary,
+                "seconds_in_section": t - self._section_start_t}

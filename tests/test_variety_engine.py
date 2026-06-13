@@ -83,3 +83,29 @@ def test_texture_evolves_across_phrases():
     # at least one of the first three phrases differs from phrase 0
     assert look1 != look0 or look2 != look0
     assert ve.phrase_index == 2
+
+
+def test_tick_fires_phrase_boundary_every_8_beats():
+    ve = VarietyEngine(seed=1)
+    ve.begin_section(_intent(bpm=120.0))
+    boundaries = 0
+    t = 0.0
+    for beat in range(16):          # 16 beats -> 2 phrase boundaries
+        t += 0.5
+        ev = ve.tick(is_beat=True, bpm=120.0, t=t)
+        if ev["phrase_boundary"]:
+            boundaries += 1
+    assert boundaries == 2
+    assert ve.phrase_index == 2
+
+
+def test_tick_time_fallback_when_no_bpm():
+    ve = VarietyEngine(seed=1)
+    ve.begin_section(_intent(bpm=0.0))
+    fired = False
+    t = 0.0
+    while t < 4.5:                  # exceed TIME_PHRASE_FALLBACK_S with no beats
+        t += 0.1
+        ev = ve.tick(is_beat=False, bpm=0.0, t=t)
+        fired = fired or ev["phrase_boundary"]
+    assert fired
