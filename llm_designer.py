@@ -333,7 +333,8 @@ A well-designed show follows this emotional curve:
       "fade_speed_seconds": 3.0,
       "strobe_allowed": false,
       "energy_level": 2,
-      "behavior": "slow_breathe"
+      "behavior": "slow_breathe",
+      "mood": "warm|cool|neon|euphoric|dark"
     }},
     ...one cue per structural section...
   ],
@@ -377,6 +378,7 @@ Controls how aggressively the lights react to drum onsets:
    - character="vocal-driven" → static_wash or beat_reactive (never strobe!)
    - character="bright/atmospheric" → rainbow_sweep or slow_breathe
    - character="rhythmic" → fast_pulse or color_chase
+10. Assign a "mood" to every cue (warm|cool|neon|euphoric|dark). Adjacent cues SHOULD use contrasting moods. The mood + color_1 seed the lighting palette, so pick an evocative color_1 per section.
 
 CRITICAL: Generate EXACTLY one cue for EVERY structural section from the telemetry.
 The "phrases" array is a backward-compatibility summary."""
@@ -457,6 +459,18 @@ def _validate_rgb(value, default=(255, 255, 255)):
         return list(default)
 
 
+def _default_mood_for_energy(energy):
+    """Fallback mood when the LLM omits one. Matches loopback's energy->mood map."""
+    e = int(energy or 0)
+    if e <= 3:
+        return "warm"
+    if e <= 6:
+        return "cool"
+    if e <= 8:
+        return "neon"
+    return "euphoric"
+
+
 def _validate_and_repair_plan(plan):
     """
     Validate AI lighting plan structure. Repair common LLM mistakes
@@ -492,6 +506,9 @@ def _validate_and_repair_plan(plan):
         # P2-2 FIX: Clamp to valid ranges — LLM might return energy_level: 50
         cue["energy_level"] = max(1, min(10, int(cue["energy_level"])))
         cue["master_dimmer_percent"] = max(0, min(100, int(cue["master_dimmer_percent"])))
+        # mood seeds the VarietyEngine palette family; default from energy if absent
+        if not cue.get("mood"):
+            cue["mood"] = _default_mood_for_energy(cue["energy_level"])
         cue.setdefault("strobe_allowed", False)
         cue.setdefault("fade_speed_seconds", 1.0)
         cue.setdefault("section_name", f"Section {i+1}")
