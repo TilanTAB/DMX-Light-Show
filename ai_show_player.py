@@ -1,16 +1,10 @@
 """DMX AI Show Player — synced WAV playback. Subclass of DmxEngineBase."""
-import bisect
 import os
 import sys
-import json
-import math
 import time
-import wave
 import logging
-from collections import deque
-import numpy as np
 import pyaudiowpatch as pyaudio
-from dmx_engine import DmxEngineBase, SAMPLE_RATE, BLOCK_SIZE, MIN_VOLUME_GATE
+from dmx_engine import DmxEngineBase, BLOCK_SIZE
 
 logger = logging.getLogger(__name__)
 

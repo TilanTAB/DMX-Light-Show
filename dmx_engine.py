@@ -6,11 +6,9 @@ Hardware init is deferred to run() methods (also fixes C1).
 import usb.core
 import time
 import os
-import sys
 import json
 import math
 import numpy as np
-import pyaudiowpatch as pyaudio
 import logging
 from collections import deque
 import threading
@@ -501,7 +499,6 @@ class DmxEngineBase:
         energy = cue.get("energy", 5) if cue else 5
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0  # C2 FIX
         energy_boost = 0.5 + (energy / 10.0)
-        ambient_floor = 0.0  # Synced mode: AI cues provide temporal structure; no ambient floor needed
 
         k = max(kick_i * energy_boost, 0.6) if is_kick else kick_i
         s = max(snare_i * energy_boost, 0.5) if is_snare else snare_i
@@ -707,6 +704,7 @@ class DmxEngineBase:
                         "dimmer": c.get("master_dimmer_percent", 80),
                         "fade": c.get("fade_speed_seconds", 1.0),
                         "name": c.get("section_name", ""),
+                        "mood": c.get("mood"),  # carried for the VarietyEngine palette seed (Task 10)
                     })
                 self.synced_cues.sort(key=lambda x: x["start"])
                 self._cue_starts = [c["start"] for c in self.synced_cues]
@@ -733,7 +731,8 @@ class DmxEngineBase:
         return None
 
     def process_audio(self, indata, elapsed_seconds=None, input_format="int16", actual_sample_rate=None):
-        """Core engine: FFT → onset detection → loopback behavior dispatch → DMX output."""
+        """Core engine: FFT → onset detection → mode dispatch → DMX output.
+        Shared by both modes; the per-mode tail lives in the subclass _dispatch()."""
         self.frame_counter += 1
         sr = actual_sample_rate or SAMPLE_RATE
 
@@ -755,7 +754,7 @@ class DmxEngineBase:
 
         # Debug logging for first 50 frames
         if self.frame_counter <= 50 and self.frame_counter % 10 == 0:
-            logger.debug(f"[LOOPBACK frame {self.frame_counter}] vol={volume:.6f} samples={len(mono)} sr={sr}")
+            logger.debug(f"[ENGINE frame {self.frame_counter}] vol={volume:.6f} samples={len(mono)} sr={sr}")
 
         if volume < self.profile_volume_gate:
             self.out_r *= 0.92; self.out_g *= 0.92; self.out_b *= 0.92

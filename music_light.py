@@ -1,5 +1,4 @@
 """DMX loopback engine — live WASAPI capture. Subclass of DmxEngineBase."""
-import os
 import sys
 import json
 import math
@@ -8,9 +7,8 @@ import logging
 from collections import deque
 import numpy as np
 import pyaudiowpatch as pyaudio
-from dmx_engine import (DmxEngineBase, BLOCK_SIZE, SAMPLE_RATE, MIN_VOLUME_GATE,
-                        LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
-                        ONSET_COOLDOWN, DEFAULT_PALETTES)
+from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
+                        LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH)
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +277,6 @@ class DMXEngine(DmxEngineBase):
         current_time = time.time()
         beats_per_sec = self.beats_per_sec
         # --- Loopback dispatch ---
-        t_start_render = time.perf_counter()
         t = self.frame_counter * BLOCK_SIZE / sr
 
         # ── Color cycling based on profile mode ──
