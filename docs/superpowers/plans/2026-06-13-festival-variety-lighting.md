@@ -106,9 +106,21 @@ git commit -m "test: add pytest scaffolding for new pure-logic modules"
 
 ---
 
-## Task 2: Extract `DmxEngineBase` verbatim (Checkpoint 1)
+## Refactor reality (discovered 2026-06-13): reconcile, don't copy
 
-Pure refactor, **zero behavior change**. Move the shared methods out of `music_light.py` into a new base class; make the loopback engine subclass it.
+An AST diff of the two `DMXEngine` classes proved the "24 identical methods" premise wrong. **17 methods are byte-identical** (move verbatim). **7 have drifted** and must be *reconciled* so the shared copy reproduces each mode's current output exactly (behavior-preserving):
+
+- `__init__` → base holds shared state; each subclass adds mode-specific state after `super().__init__()`.
+- `load_ai_show` → base = synced's superset (palettes + cues + returns audio_file).
+- `process_audio` → base common pipeline + abstract `_dispatch` seam. **The beat-detection tuning also drifted**, so make it per-mode attributes the base reads: `self.profile_gain_boost` (loopback ≈50×, synced 1.0) and `self.profile_agc_thresh` (loopback profile value, synced 0.7). Base also computes `self._beat_velocity` and `self.beats_per_sec`. Mode-only bits move to `_dispatch`: loopback's color-phase cycling + `_detect_auto_behavior` + IPC write + DIAG log; synced's 16-beat palette rotation + cue lookup.
+- 4 punchy renderers → single shared copy: use `self._beat_velocity` for master in `bass_white_blast`/`blackout_punch`/`fast_pulse` (unifies the three; loopback gains velocity — a bonus, not a regression), and gate `_render_beat_reactive`'s ambient-floor + energy-state color-temp shift behind `self.loopback_ambient` (True in loopback subclass, False in synced) so both render exactly as today.
+- Mode-only methods stay in their subclass: loopback keeps `_render_loopback_direct`, `_detect_auto_behavior`, `load_profile`, `run_loopback_mode`; synced keeps `_get_active_cue`(→ base, harmless), `run_synced_mode`.
+
+Verification for Tasks 2–3 is import-smoke + the existing pytest suite; **behavioral equivalence must be confirmed on hardware by the user** (loopback + a synced show should look identical to pre-refactor).
+
+## Task 2: Extract `DmxEngineBase` (Checkpoint 1) — reconciling extraction
+
+Refactor targeting **zero behavior change**. Move the 17 identical methods verbatim and reconcile the 7 drifted ones per the section above; make the loopback engine subclass the base.
 
 **Files:**
 - Create: `dmx_engine.py`
