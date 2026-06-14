@@ -337,16 +337,17 @@ class DmxEngineBase:
         # P0-1 FIX: Defensive cue access — cue can be None in edge cases
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
         strobe_ok = cue.get("strobe", False) if cue else False
+        velocity_master = (120.0 + 135.0 * self._beat_velocity) * dimmer
 
         if is_kick:
             self.out_r, self.out_g, self.out_b = kick_color
             self.out_w = 255.0 * dimmer
-            self.out_master = 255.0 * dimmer
+            self.out_master = velocity_master
             self.out_strobe = 200.0 if strobe_ok else 0.0
         elif is_snare:
             self.out_r, self.out_g, self.out_b = accent_color
             self.out_w = 150.0 * dimmer
-            self.out_master = 255.0 * dimmer
+            self.out_master = velocity_master
             self.out_strobe = 200.0 if strobe_ok else 0.0
         else:
             self.out_r = ema(self.out_r, 0, 0, 0.4)
@@ -380,10 +381,11 @@ class DmxEngineBase:
         energy = cue.get("energy", 7) if cue else 7
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
         energy_scale = 0.5 + (energy / 10.0)  # 0.6 to 1.5
+        velocity_master = (120.0 + 135.0 * self._beat_velocity) * dimmer
 
         if is_kick:
             self.out_w = 255.0 * dimmer
-            self.out_master = 255.0 * dimmer
+            self.out_master = velocity_master
         else:
             self.out_w = ema(self.out_w, 0, 0, 0.35)
 
@@ -475,15 +477,16 @@ class DmxEngineBase:
         energy = cue.get("energy", 7) if cue else 7
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
         decay_speed = 0.3 + (energy / 20.0)  # Higher energy = faster decay = sharper pulses
+        velocity_master = (120.0 + 135.0 * self._beat_velocity) * dimmer
 
         if is_kick:
             self.out_r, self.out_g, self.out_b = kick_color
             self.out_w = 200.0 * dimmer
-            self.out_master = 255.0 * dimmer
+            self.out_master = velocity_master
         elif is_snare:
             self.out_r, self.out_g, self.out_b = accent_color
             self.out_w = 100.0 * dimmer
-            self.out_master = 255.0 * dimmer
+            self.out_master = velocity_master
         else:
             self.out_r = ema(self.out_r, 0, 0, decay_speed)
             self.out_g = ema(self.out_g, 0, 0, decay_speed)
@@ -494,14 +497,11 @@ class DmxEngineBase:
 
     def _render_beat_reactive(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                               kick_color, accent_color, volume, cue, t):
-        """Default beat-reactive mode: kick→color_1, snare→color_2, bass→white.
-        In loopback mode, maintains an ambient floor so lights are always alive."""
+        """Default beat-reactive mode: kick→color_1, snare→color_2, bass→white."""
         energy = cue.get("energy", 5) if cue else 5
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0  # C2 FIX
         energy_boost = 0.5 + (energy / 10.0)
-        # Ambient floor: lights should ALWAYS be somewhat on when music is playing
-        ambient = min(1.0, volume * 8000)  # Volume drives base brightness
-        ambient_floor = max(0.15, ambient * 0.4)  # Min 15% brightness
+        ambient_floor = 0.0  # Synced mode: AI cues provide temporal structure; no ambient floor needed
 
         k = max(kick_i * energy_boost, 0.6) if is_kick else kick_i
         s = max(snare_i * energy_boost, 0.5) if is_snare else snare_i
@@ -510,27 +510,8 @@ class DmxEngineBase:
         tg = min(255.0, kick_color[1] * k + accent_color[1] * s + accent_color[1] * mid_i * 0.15)
         tb = min(255.0, kick_color[2] * k + accent_color[2] * s + accent_color[2] * mid_i * 0.15)
 
-        # S6: Color temperature shift based on energy state.
-        # Calm sections → warm shift (amber/pink ~2700K feel)
-        # High energy → cool shift (blue/violet ~6500K feel)
-        # This is how professional LDs create emotional narrative through color alone.
-        if self.energy_state == "calm":
-            tr = min(255.0, tr * 1.1)   # Boost red warmth
-            tg *= 0.85                   # Reduce green
-            tb *= 0.6                    # Strongly reduce blue → warm amber
-        elif self.energy_state == "high":
-            tr *= 0.7                    # Reduce red warmth
-            tg *= 0.9                    # Slightly reduce green
-            tb = min(255.0, tb * 1.15)  # Boost blue → cool epic feel
-
-        # Apply ambient floor — lights always glow when music plays
-        if ambient_floor > 0:
-            tr = max(tr, kick_color[0] * ambient_floor)
-            tg = max(tg, kick_color[1] * ambient_floor)
-            tb = max(tb, kick_color[2] * ambient_floor)
-
-        tw = 255.0 if is_kick else (120.0 if is_snare else max(hihat_i * 100, ambient_floor * 50))
-        tm = (255.0 if (is_kick or is_snare) else max(80.0, volume * 8000, ambient_floor * 255)) * dimmer  # C2 FIX
+        tw = 255.0 if is_kick else (120.0 if is_snare else hihat_i * 100)
+        tm = (255.0 if (is_kick or is_snare) else max(80.0, volume * 8000)) * dimmer  # C2 FIX
 
         is_beat = is_kick or is_snare
         att = 0.95 if is_beat else 0.15
