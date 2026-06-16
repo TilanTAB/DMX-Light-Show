@@ -1,8 +1,12 @@
 import os
 import json
+import time
 import logging
 import requests
 from dotenv import load_dotenv
+
+# Load .env before any os.getenv() calls
+load_dotenv()
 
 # Set up comprehensive logging to file
 logging.basicConfig(
@@ -12,8 +16,99 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load variables from .env
-load_dotenv()
+# Module-level boto3 client cache — created once on first Bedrock call
+_bedrock_client = None
+
+
+def _extract_json_string(raw_text):
+    """Strip markdown code fences if present. No-op for clean JSON.
+    Needed because Claude models sometimes wrap JSON in ```json ... ``` blocks
+    even when instructed not to.
+    """
+    text = raw_text.strip()
+    if text.startswith("```") and "\n" in text:
+        first_newline = text.index("\n")
+        text = text[first_newline + 1:]
+        if text.endswith("```"):
+            text = text[:-3].strip()
+    return text
+
+
+def _call_azure(system_message, prompt):
+    """Send a chat completion request to Azure OpenAI.
+    Returns the raw content string. Raises on HTTP or network errors.
+    """
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": api_key,
+    }
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        # B3 NOTE: temperature/max_tokens/top_p removed — this Azure deployment
+        # (GPT-5 Nano) rejects them as unsupported. Model uses its own defaults.
+    }
+
+    logger.info(f"Sending prompt to Azure (deployment: {deployment_name})...")
+    response = requests.post(url, headers=headers, json=payload, timeout=120)
+
+    if response.status_code != 200:
+        logger.error(f"Azure returned {response.status_code}: {response.text}")
+        raise RuntimeError(f"Azure API Error {response.status_code}: {response.text}")
+
+    json_data = response.json()
+    logger.info("Azure API response received successfully.")
+    return json_data["choices"][0]["message"]["content"]
+
+
+def _call_bedrock(system_message, prompt):
+    """Send a chat completion request to Amazon Bedrock via the Converse API.
+    The Converse API is model-agnostic — works for Claude, Titan, and Nova.
+    Returns the raw content string. Raises on errors.
+    """
+    global _bedrock_client
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError:
+        # Re-raise as ImportError (not RuntimeError) so the retry loop can
+        # distinguish a missing package (permanent) from a transient network error.
+        raise ImportError(
+            "boto3 is required for Bedrock support. Install it with: pip install boto3"
+        )
+
+    region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-4-20250514-v1:0")
+
+    # Cache the client — boto3.client() loads service model JSON and resolves
+    # credentials; creating it on every retry attempt wastes ~100-200ms each time.
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(read_timeout=120, retries={"max_attempts": 0}),
+        )
+
+    logger.info(f"Sending prompt to Bedrock (model: {model_id}, region: {region})...")
+
+    response = _bedrock_client.converse(
+        modelId=model_id,
+        system=[{"text": system_message}],
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 4096},
+    )
+
+    logger.info("Bedrock API response received successfully.")
+    return response["output"]["message"]["content"][0]["text"]
 
 
 def _build_section_descriptions(sections):
@@ -79,19 +174,35 @@ def _build_section_descriptions(sections):
 
 def get_gpt_lighting_plan(audio_features):
     """
-    Sends LIVE rhythm telemetry (BPM, bass density, energy) to GPT-5 Nano 
-    to generate a custom JSON lighting plan.
+    Sends audio telemetry to the configured LLM provider to generate a custom
+    JSON lighting plan. Provider is selected via LLM_PROVIDER env var:
+      "azure"   — Azure OpenAI (default, backward-compatible)
+      "bedrock" — Amazon Bedrock (Claude, Titan, or Nova via Converse API)
     """
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    api_key = os.getenv("AZURE_OPENAI_API_KEY")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION")
-    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-    
-    if not all([endpoint, api_key, api_version, deployment_name]):
-        print("[-] Missing Azure credentials in .env file.")
-        return None
+    provider = os.getenv("LLM_PROVIDER", "azure").lower().strip()
 
-    print(f"\n[+] Sending Rhythm Telemetry to Azure GPT-5 Nano...")
+    # Validate credentials for the chosen provider
+    if provider == "bedrock":
+        # Fast-fail before building the 2000-token prompt if boto3 isn't installed
+        try:
+            import boto3  # noqa: F401
+        except ImportError:
+            print("[-] boto3 is required for Bedrock. Install: pip install boto3")
+            return None
+        if not os.getenv("AWS_DEFAULT_REGION"):
+            print("[-] Missing AWS_DEFAULT_REGION in .env file for Bedrock.")
+            return None
+        print(f"\n[+] Sending Rhythm Telemetry to Bedrock ({os.getenv('BEDROCK_MODEL_ID', 'anthropic.claude-sonnet-4-20250514-v1:0')})...")
+    else:
+        # Default: azure
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+        if not all([endpoint, api_key, api_version, deployment_name]):
+            print("[-] Missing Azure credentials in .env file.")
+            return None
+        print(f"\n[+] Sending Rhythm Telemetry to Azure ({deployment_name})...")
 
     # B1 FIX: Replace raw spectral timeline (40 rows of numbers, ~2000 tokens)
     # with prose summaries the LLM can actually reason about (~300 tokens).
@@ -222,7 +333,8 @@ A well-designed show follows this emotional curve:
       "fade_speed_seconds": 3.0,
       "strobe_allowed": false,
       "energy_level": 2,
-      "behavior": "slow_breathe"
+      "behavior": "slow_breathe",
+      "mood": "warm|cool|neon|euphoric|dark"
     }},
     ...one cue per structural section...
   ],
@@ -266,17 +378,11 @@ Controls how aggressively the lights react to drum onsets:
    - character="vocal-driven" → static_wash or beat_reactive (never strobe!)
    - character="bright/atmospheric" → rainbow_sweep or slow_breathe
    - character="rhythmic" → fast_pulse or color_chase
+10. Assign a "mood" to every cue (warm|cool|neon|euphoric|dark). Adjacent cues SHOULD use contrasting moods. The mood + color_1 seed the lighting palette, so pick an evocative color_1 per section.
 
 CRITICAL: Generate EXACTLY one cue for EVERY structural section from the telemetry.
 The "phrases" array is a backward-compatibility summary."""
-    
-    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "api-key": api_key
-    }
-    
+
     # B4 FIX: Stronger system message with step-by-step reasoning framework
     system_message = """You are a professional concert lighting director who outputs ONLY valid JSON lighting plans for DMX fixtures.
 
@@ -290,61 +396,47 @@ REASONING PROCESS (follow this order):
 
 Output ONLY the JSON object. No explanation, no markdown, no comments."""
 
-    payload = {
-        "messages": [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": prompt}
-        ],
-        "response_format": {"type": "json_object"},
-        # B3 NOTE: temperature/max_tokens/top_p removed — this Azure deployment
-        # (GPT-5 Nano) rejects them as unsupported. Model uses its own defaults.
-    }
-
     # Retry with backoff for transient failures
-    import time as _time
     max_retries = 2
     for attempt in range(max_retries + 1):
         try:
-            logger.info(f"Sending prompt to Azure via python requests (Model: {deployment_name}, attempt {attempt+1})...")
-            
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
-            
-            if response.status_code != 200:
-                logger.error(f"Azure returned status code {response.status_code}: {response.text}")
-                print(f"[-] Azure API Error {response.status_code}: {response.text}")
-                if attempt < max_retries and response.status_code >= 500:
-                    print(f"[~] Retrying in {5 * (attempt+1)}s...")
-                    _time.sleep(5 * (attempt + 1))
-                    continue
-                return None
-                
-            json_data = response.json()
-            logger.info("Azure API response received successfully.")
-            
-            content = json_data['choices'][0]['message']['content']
+            logger.info(f"LLM request via {provider} (attempt {attempt+1})...")
+
+            if provider == "bedrock":
+                raw_content = _call_bedrock(system_message, prompt)
+            else:
+                raw_content = _call_azure(system_message, prompt)
+
+            # _extract_json_string strips markdown fences Claude sometimes adds
+            content = _extract_json_string(raw_content)
             lighting_plan = json.loads(content)
-            
+
             # I2 FIX: Validate and repair AI response before returning
             lighting_plan = _validate_and_repair_plan(lighting_plan)
-            
+
             return lighting_plan
 
-        except requests.exceptions.Timeout:
-            logger.error(f"Azure API request timed out (attempt {attempt+1}).")
-            print(f"[-] GPT-5 Nano Timeout (attempt {attempt+1}/{max_retries+1}).")
-            if attempt < max_retries:
-                print(f"[~] Retrying in {5 * (attempt+1)}s...")
-                _time.sleep(5 * (attempt + 1))
-                continue
-            print("[-] All retries exhausted.")
-            return None
         except json.JSONDecodeError as e:
+            # Malformed JSON is never retried — same response on retry
             logger.error(f"AI returned invalid JSON: {e}")
             print(f"[-] AI response was not valid JSON: {e}")
             return None
+        except ImportError as e:
+            # Missing package — retry won't help, fail immediately
+            logger.error(f"Missing dependency: {e}")
+            print(f"[-] Missing dependency: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Azure API Call Failed: {e}", exc_info=True)
-            print(f"[-] GPT-5 Nano Connection Error: {e}")
+            # Covers: requests.exceptions.Timeout (Azure), botocore ReadTimeoutError
+            # (Bedrock), RuntimeError (HTTP 4xx/5xx), NoCredentialsError, etc.
+            # All are retried — permanent failures (bad creds, 401) will fail
+            # consistently and exhaust retries, which is acceptable.
+            logger.error(f"LLM call failed ({provider}, attempt {attempt+1}): {e}", exc_info=True)
+            print(f"[-] LLM Error ({provider}): {e}")
+            if attempt < max_retries:
+                print(f"[~] Retrying in {5 * (attempt+1)}s...")
+                time.sleep(5 * (attempt + 1))
+                continue
             return None
 
 
@@ -365,6 +457,18 @@ def _validate_rgb(value, default=(255, 255, 255)):
         return [max(0, min(255, int(v))) for v in value]
     except (ValueError, TypeError):
         return list(default)
+
+
+def _default_mood_for_energy(energy):
+    """Fallback mood when the LLM omits one. Matches loopback's energy->mood map."""
+    e = int(energy or 0)
+    if e <= 3:
+        return "warm"
+    if e <= 6:
+        return "cool"
+    if e <= 8:
+        return "neon"
+    return "euphoric"
 
 
 def _validate_and_repair_plan(plan):
@@ -402,6 +506,9 @@ def _validate_and_repair_plan(plan):
         # P2-2 FIX: Clamp to valid ranges — LLM might return energy_level: 50
         cue["energy_level"] = max(1, min(10, int(cue["energy_level"])))
         cue["master_dimmer_percent"] = max(0, min(100, int(cue["master_dimmer_percent"])))
+        # mood seeds the VarietyEngine palette family; default from energy if absent
+        if not cue.get("mood"):
+            cue["mood"] = _default_mood_for_energy(cue["energy_level"])
         cue.setdefault("strobe_allowed", False)
         cue.setdefault("fade_speed_seconds", 1.0)
         cue.setdefault("section_name", f"Section {i+1}")
@@ -444,10 +551,10 @@ def _validate_and_repair_plan(plan):
     return plan
 
 if __name__ == "__main__":
-    # Test script execution
-    print("Testing Azure connection with Live Rhythm Data (Make sure .env is filled out!)")
-    
-    # Example telemetry that our music_light.py script will calculate live:
+    # Test script execution — uses LLM_PROVIDER from .env (default: azure)
+    _provider = os.getenv("LLM_PROVIDER", "azure")
+    print(f"Testing {_provider.upper()} connection (make sure .env is filled out!)")
+
     sample_rhythm_data = {
         "bpm": 142.5,
         "bass_density": "extremely high",
@@ -455,8 +562,8 @@ if __name__ == "__main__":
         "mid_frequency_presence": "low",
         "estimated_vibe": "hard techno / heavy bass"
     }
-    
+
     plan = get_gpt_lighting_plan(sample_rhythm_data)
     if plan:
-        print("\n[+] Success! GPT generated the following DMX sequence based on rhythm:")
+        print(f"\n[+] Success! {_provider.upper()} generated the following DMX sequence:")
         print(json.dumps(plan, indent=2))
