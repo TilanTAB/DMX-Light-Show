@@ -71,6 +71,10 @@ ABYSSAL_DISCONTINUITY_THRESHOLD = 1.0  # seconds; a real audio-frame-to-frame
 # this renderer was skipped (ambient_pool rotated away and back) or a seek
 # happened -- either way, treat it as "just arrived" so blooms/glints reset
 # to rare instead of firing instantly.
+# This safety depends on `t` being a sample-derived virtual clock (frame_counter
+# or frames_played / sample_rate), NOT time.time() -- a stalled audio thread
+# doesn't advance `t` at all, so no wall-clock delay can misfire this. If `t`
+# is ever changed to wall-clock, this threshold must be revisited.
 
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
@@ -202,11 +206,12 @@ class DMXEngine:
         self._ab_bass = 0.0                # smoothed bass activity (EMA of kick_i)
         self._ab_bloom_active = False
         self._ab_bloom_t0 = 0.0            # t when the current/last bloom started
-        self._ab_last_bloom_t = -999.0      # t when the last bloom finished (for gap timing)
+        self._ab_last_bloom_t = 0.0         # placeholder -- always overwritten by the
+                                             # discontinuity-reset below before first use
         self._ab_bloom_color = (0, 210, 210)
         self._ab_glint_active = False
         self._ab_glint_t0 = 0.0
-        self._ab_last_glint_t = -999.0
+        self._ab_last_glint_t = 0.0         # same as _ab_last_bloom_t -- placeholder only
         self._ab_last_render_t = None      # last t this renderer was actually called with (None = never)
 
         # SYNC FIX: Pre-cached Hanning windows keyed by block size.
