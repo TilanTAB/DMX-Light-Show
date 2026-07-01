@@ -83,7 +83,7 @@ VALID_BEHAVIORS = {
     "buildup_ramp", "static_wash", "strobe_blast", "fast_pulse",
     "beat_reactive", "rainbow_sweep", "instant_flash",
     # Ambient/chill behaviors
-    "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer",
+    "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
 }
 
 
@@ -266,6 +266,7 @@ class DMXEngine:
             "candlelight": self._render_candlelight,
             "sunset_fade": self._render_sunset_fade,
             "aurora_shimmer": self._render_aurora_shimmer,
+            "abyssal_bloom": self._render_abyssal_bloom,
         }
 
     # ----------------------------------------------------------
@@ -1153,7 +1154,8 @@ class DMXEngine:
         if self.energy_state == "calm":
             if beats_per_sec < 0.5 and recent_energy < overall_avg * 0.5:
                 # Very quiet — rotate through ambient behaviors for variety
-                ambient_pool = ["ocean_drift", "candlelight", "aurora_shimmer", "sunset_fade"]
+                ambient_pool = ["ocean_drift", "candlelight", "aurora_shimmer",
+                               "sunset_fade", "abyssal_bloom"]
                 ambient_idx = int(current_time / 15.0) % len(ambient_pool)  # Switch every 15s
                 return ambient_pool[ambient_idx]
             elif beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7:
@@ -1378,8 +1380,8 @@ class DMXEngine:
             # Ambient/chill behaviors → use the standard renderer dispatch
             # (these renderers take the same args as synced-mode renderers)
             ambient_behaviors = {"ocean_drift", "candlelight", "sunset_fade",
-                                 "aurora_shimmer", "slow_breathe", "static_wash",
-                                 "buildup_ramp", "rainbow_sweep"}
+                                 "aurora_shimmer", "abyssal_bloom", "slow_breathe",
+                                 "static_wash", "buildup_ramp", "rainbow_sweep"}
 
             if auto_behavior in ambient_behaviors:
                 cue = {"dimmer": 50, "energy": 3, "start": 0, "end": 60,
