@@ -48,6 +48,24 @@ LOOPBACK_GAIN_BOOST = 50.0  # WASAPI loopback is extremely quiet (~0.002 vol)
 LOOPBACK_VOLUME_GATE = 0.00005  # Near-zero gate — if there's any audio, process it
 LOOPBACK_AGC_THRESH = 0.3   # Lower AGC threshold for loopback (vs 0.7 for synced)
 
+# abyssal_bloom renderer tuning (module constants, not profile_* — avoids
+# adding new load_profile keys for a single renderer's parameters).
+ABYSSAL_FLOOR_MIN = 0.03
+ABYSSAL_FLOOR_MAX = 0.10
+ABYSSAL_BLOOM_BASE = 0.45
+ABYSSAL_BLOOM_MAX = 0.70
+ABYSSAL_BLOOM_BASS_GAIN = 0.25
+ABYSSAL_BLOOM_RISE = 1.5
+ABYSSAL_BLOOM_HOLD = 0.4
+ABYSSAL_BLOOM_FALL = 3.5
+ABYSSAL_BLOOM_GAP_MIN = 3.0
+ABYSSAL_BLOOM_INTERVAL = 11.0
+ABYSSAL_BLOOM_NUDGE_THRESH = 0.25
+ABYSSAL_GLINT_RISE = 0.2
+ABYSSAL_GLINT_FALL = 0.6
+ABYSSAL_GLINT_INTERVAL = 18.0
+ABYSSAL_GLINT_THRESH = 0.5
+
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
     ((255, 0, 50), (0, 150, 255)),     # Red vs Blue
@@ -173,6 +191,16 @@ class DMXEngine:
         self.peak_kick = 0.0
         self.peak_snare = 0.0
         self.peak_mid = 0.0
+
+        # abyssal_bloom renderer state
+        self._ab_bass = 0.0                # smoothed bass activity (EMA of kick_i)
+        self._ab_bloom_active = False
+        self._ab_bloom_t0 = 0.0            # t when the current/last bloom started
+        self._ab_last_bloom_t = -999.0      # t when the last bloom finished (for gap timing)
+        self._ab_bloom_color = (0, 210, 210)
+        self._ab_glint_active = False
+        self._ab_glint_t0 = 0.0
+        self._ab_last_glint_t = -999.0
 
         # SYNC FIX: Pre-cached Hanning windows keyed by block size.
         self._hanning_cache = {}
@@ -842,6 +870,109 @@ class DMXEngine:
         self.out_b = ema(self.out_b, b * brightness, 0.04, 0.03)
         self.out_w = ema(self.out_w, 15.0 * brightness, 0.02, 0.02)
         self.out_master = ema(self.out_master, 200.0 * brightness, 0.04, 0.03)
+        self.out_strobe = 0
+
+    def _render_abyssal_bloom(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                              kick_color, accent_color, volume, cue, t):
+        """Deep & sparse ambient: near-black drifting floor, rare bass-reactive
+        teal blooms, rarer white glints. Restraint is the effect — only one
+        bloom or glint active at a time, with a hard minimum gap between blooms
+        regardless of bass energy."""
+        dimmer = (cue.get("dimmer", 50) if cue else 50) / 100.0
+
+        # --- Smoothed bass activity (not the raw per-frame kick_i) ---
+        self._ab_bass = ema(self._ab_bass, min(1.0, kick_i), 0.2, 0.05)
+
+        # --- Layer 1: floor (two slow non-harmonic sines, deep blue <-> violet) ---
+        # Deliberately NOT scaled by `dimmer` here: FLOOR_MIN/MAX already ARE the
+        # intended final 3-10% floor (the spec's "never fully black" guarantee).
+        # Scaling it again by the cue's dimmer (~0.5 typical) would push it below
+        # the visible floor of every sibling ambient renderer -- likely reading
+        # as fully off on real LED hardware (PWM dead-zone).
+        wave1 = math.sin(t * 0.05) * 0.5 + 0.5
+        wave2 = math.sin(t * 0.033 + 1.1) * 0.5 + 0.5
+        floor_blend = wave1 * 0.6 + wave2 * 0.4
+        floor_brightness = (ABYSSAL_FLOOR_MIN +
+                            (ABYSSAL_FLOOR_MAX - ABYSSAL_FLOOR_MIN) * floor_blend)
+        deep_blue = (10, 20, 120)
+        deep_violet = (60, 10, 130)
+        floor_color = lerp_color(deep_blue, deep_violet, floor_blend)
+
+        # --- Layer 2: bloom (rare teal swell, bass-reactive but bounded) ---
+        bloom_gap = max(ABYSSAL_BLOOM_GAP_MIN,
+                        ABYSSAL_BLOOM_INTERVAL * (1.0 - self._ab_bass * 0.6))
+        if not self._ab_bloom_active and not self._ab_glint_active:
+            time_since_last = t - self._ab_last_bloom_t
+            timer_ready = time_since_last >= ABYSSAL_BLOOM_INTERVAL
+            nudge_ready = (time_since_last >= bloom_gap and
+                          kick_i > ABYSSAL_BLOOM_NUDGE_THRESH)
+            if timer_ready or nudge_ready:
+                self._ab_bloom_active = True
+                self._ab_bloom_t0 = t
+                self._ab_bloom_color = lerp_color(accent_color, (0, 210, 210), 0.6)
+
+        bloom_brightness = 0.0
+        if self._ab_bloom_active:
+            age = t - self._ab_bloom_t0
+            total = ABYSSAL_BLOOM_RISE + ABYSSAL_BLOOM_HOLD + ABYSSAL_BLOOM_FALL
+            if age >= total:
+                self._ab_bloom_active = False
+                self._ab_last_bloom_t = t
+            else:
+                if age < ABYSSAL_BLOOM_RISE:
+                    p = age / ABYSSAL_BLOOM_RISE
+                    env = p * p * (3.0 - 2.0 * p)
+                elif age < ABYSSAL_BLOOM_RISE + ABYSSAL_BLOOM_HOLD:
+                    env = 1.0
+                else:
+                    fall_age = age - ABYSSAL_BLOOM_RISE - ABYSSAL_BLOOM_HOLD
+                    p = 1.0 - (fall_age / ABYSSAL_BLOOM_FALL)
+                    env = p * p * (3.0 - 2.0 * p)
+                peak = min(ABYSSAL_BLOOM_MAX,
+                          ABYSSAL_BLOOM_BASE + self._ab_bass * ABYSSAL_BLOOM_BASS_GAIN)
+                bloom_brightness = env * peak * dimmer
+
+        # --- Layer 3: glint (rarer white flare) ---
+        # Mutually exclusive with bloom (spec: "only one bloom OR glint active
+        # at a time") -- a glint can't arm while a bloom is mid-swell, and the
+        # bloom-arming check above already excludes an active glint too.
+        if not self._ab_glint_active and not self._ab_bloom_active:
+            time_since_glint = t - self._ab_last_glint_t
+            timer_ready = time_since_glint >= ABYSSAL_GLINT_INTERVAL
+            hihat_ready = (time_since_glint >= ABYSSAL_BLOOM_GAP_MIN and
+                          hihat_i > ABYSSAL_GLINT_THRESH)
+            if timer_ready or hihat_ready:
+                self._ab_glint_active = True
+                self._ab_glint_t0 = t
+
+        glint_brightness = 0.0
+        if self._ab_glint_active:
+            age = t - self._ab_glint_t0
+            total = ABYSSAL_GLINT_RISE + ABYSSAL_GLINT_FALL
+            if age >= total:
+                self._ab_glint_active = False
+                self._ab_last_glint_t = t
+            else:
+                if age < ABYSSAL_GLINT_RISE:
+                    glint_brightness = (age / ABYSSAL_GLINT_RISE) * dimmer
+                else:
+                    fall_age = age - ABYSSAL_GLINT_RISE
+                    glint_brightness = (1.0 - fall_age / ABYSSAL_GLINT_FALL) * dimmer
+
+        # --- Compose: bloom/glint lift above the floor, never darken it ---
+        r = max(floor_color[0] * floor_brightness, self._ab_bloom_color[0] * bloom_brightness)
+        g = max(floor_color[1] * floor_brightness, self._ab_bloom_color[1] * bloom_brightness)
+        b = max(floor_color[2] * floor_brightness, self._ab_bloom_color[2] * bloom_brightness)
+        w = 200.0 * glint_brightness
+        # 255.0 (not an arbitrary scalar) so floor_brightness's 0.03-0.10 maps
+        # directly to "3-10% of full brightness" as the spec literally states.
+        master = max(255.0 * floor_brightness, 200.0 * bloom_brightness, 220.0 * glint_brightness)
+
+        self.out_r = ema(self.out_r, r, 0.05, 0.03)
+        self.out_g = ema(self.out_g, g, 0.05, 0.03)
+        self.out_b = ema(self.out_b, b, 0.05, 0.03)
+        self.out_w = ema(self.out_w, w, 0.3, 0.15)
+        self.out_master = ema(self.out_master, master, 0.05, 0.03)
         self.out_strobe = 0
 
     # ============================================================
