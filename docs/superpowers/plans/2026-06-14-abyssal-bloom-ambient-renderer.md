@@ -536,6 +536,106 @@ smoke test."
 
 ---
 
+## Task 5 (added post-implementation, from final holistic review): self-healing state reset
+
+A final holistic review — run after Tasks 1-4 were each individually implemented and approved — caught an integration issue no task-scoped review could see: `_render_abyssal_bloom` is the **only stateful renderer** among otherwise-stateless ambient siblings, and nothing resets its `_ab_*` timers when the behavior is deselected and later reselected. Two concrete consequences:
+1. **Loopback re-entry**: the `ambient_pool` rotates through 5 behaviors every 15s; while `abyssal_bloom` isn't selected, its `_ab_last_bloom_t`/`_ab_last_glint_t` freeze while the frame clock keeps advancing. On return (~every 75s in a sustained quiet passage), `time_since_last` is always far past `ABYSSAL_BLOOM_INTERVAL`, so it **always** fires an instant bloom — the opposite of "rare."
+2. **Synced-mode seeks**: the existing `age = max(0.0, ...)` clamp (added earlier) prevents a brightness-spike on a small backward seek, but a large seek (forward or backward) still leaves `_ab_last_bloom_t`/`_ab_last_glint_t` desynced from the new `t` — causing either an instant forced bloom (forward seek) or up to tens of seconds of dead floor (backward seek).
+
+**User decision: add a self-healing reset** (rather than accept-as-feature or defer). Mechanism: track the renderer's own last-called timestamp (`self._ab_last_render_t`); if the gap since the last call exceeds a threshold — covering re-entry after being deselected, and any seek in either direction — reset the bloom/glint state to "just had one" so the next natural bloom is still a full interval away, rather than firing immediately. This requires **no dispatch-layer changes** (matching the "no engine refactor" non-goal) — it's entirely self-contained within the renderer, detected purely from watching its own `t` sequence.
+
+**Side effect (intentional, not a regression):** this also changes first-ever activation. Previously, `_ab_last_bloom_t = -999.0` in `__init__` made the very first call always immediately bloom-eligible ("no artificial startup delay"). Under the new mechanism, first activation is indistinguishable from "returning after a long gap" (since `_ab_last_render_t` starts unset), so it now goes through the same reset path and waits one full interval before its first bloom. This is arguably *more* consistent with "restraint is the effect" than the original instant-bloom-on-cold-start behavior — call this out in the implementation commit, not a silent behavior change.
+
+### Task 5 implementation
+
+**Files:**
+- Modify: `music_light.py`
+
+- [ ] **Step 1: Add the discontinuity threshold constant**
+
+Add to the `ABYSSAL_*` constants block (after `ABYSSAL_GLINT_THRESH = 0.5`):
+```python
+ABYSSAL_DISCONTINUITY_THRESHOLD = 1.0  # seconds; a real audio-frame-to-frame
+# gap while this behavior stays selected is ~0.01s. Anything bigger means
+# this renderer was skipped (ambient_pool rotated away and back) or a seek
+# happened -- either way, treat it as "just arrived" so blooms/glints reset
+# to rare instead of firing instantly.
+```
+
+- [ ] **Step 2: Add the new instance state var in `__init__`**
+
+In the `# abyssal_bloom renderer state` block, add one new field:
+```python
+        self._ab_last_render_t = None      # last t this renderer was actually called with (None = never)
+```
+(Alongside the existing `_ab_bass`, `_ab_bloom_active`, etc. — order within the block doesn't matter.)
+
+- [ ] **Step 3: Add the discontinuity check as the first lines of `_render_abyssal_bloom`**
+
+Immediately after the docstring, before the `dimmer = ...` line, insert:
+```python
+        # Self-healing reset: if this renderer wasn't called recently (skipped
+        # while another ambient behavior was selected) or `t` jumped (a synced
+        # seek in either direction), treat it as a fresh arrival rather than
+        # letting stale timers fire an instant bloom/glint or desync for tens
+        # of seconds. Covers both the loopback re-entry case and the seek case
+        # with one mechanism -- no dispatch-layer changes needed.
+        if (self._ab_last_render_t is None or
+                abs(t - self._ab_last_render_t) > ABYSSAL_DISCONTINUITY_THRESHOLD):
+            self._ab_bloom_active = False
+            self._ab_glint_active = False
+            self._ab_last_bloom_t = t
+            self._ab_last_glint_t = t
+        self._ab_last_render_t = t
+
+```
+This runs before the existing bloom-arming/glint-arming logic, so a detected discontinuity always takes effect before anything else in the frame.
+
+- [ ] **Step 4: Verify no syntax break and instantiation still works**
+
+Run: `.venv\Scripts\python.exe -c "import ast; ast.parse(open('music_light.py', encoding='utf-8').read()); print('parses OK')"` → expect `parses OK`.
+Run: `.venv\Scripts\python.exe -c "import music_light; e = music_light.DMXEngine(); print('last_render_t=', e._ab_last_render_t)"` → expect `last_render_t= None`.
+
+- [ ] **Step 5: Verify the re-entry fix directly**
+
+```
+.venv\Scripts\python.exe -c "
+import music_light
+e = music_light.DMXEngine()
+cue = {'dimmer': 50}
+# Simulate: renderer active for a bit, then a big gap (deselected for 60s), then called again.
+e._render_abyssal_bloom(0.0,0,0,0,False,False,(80,0,200),(0,100,180),0.01,cue, 1.0)
+e._ab_last_bloom_t = 1.0  # pretend a bloom just happened right before the gap
+before = (e._ab_bloom_active, e.out_master)
+e._render_abyssal_bloom(0.0,0,0,0,False,False,(80,0,200),(0,100,180),0.01,cue, 61.0)  # 60s later
+print('bloom_active after 60s gap:', e._ab_bloom_active, '(should be False -- reset, not instantly re-armed)')
+print('out_master after 60s gap:', round(e.out_master,2), '(should be small/floor-level, NOT a bloom spike)')
+"
+```
+Expected: `bloom_active after 60s gap: False` and a small `out_master` (floor-level, roughly single digits to ~25) — NOT a value consistent with a bloom firing (which would be in the ~100+ range for `bloom_brightness` alone before EMA smoothing).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add music_light.py
+git commit -m "feat: self-heal abyssal_bloom timers across re-entry and seeks
+
+Final holistic review found abyssal_bloom is the only stateful ambient
+renderer, with no reset hook when deselected/reselected (loopback ambient_pool
+rotation) or across a synced-mode seek -- causing a guaranteed instant bloom
+on return, or a long dead patch / forced bloom after a seek. Fix: track the
+renderer's own last-called t; a gap beyond ABYSSAL_DISCONTINUITY_THRESHOLD
+(covers both re-entry and seeks, either direction) resets bloom/glint state
+to 'just had one' instead of leaving stale timers. No dispatch-layer changes.
+
+Side effect (intentional): first-ever activation now also waits one interval
+before its first bloom, superseding the old -999.0 startup-eligibility trick
+-- more consistent with 'restraint is the effect' than an instant cold-start
+bloom."
+```
+
+---
+
 ## Self-review notes (coverage map)
 
 | Spec requirement | Task |
