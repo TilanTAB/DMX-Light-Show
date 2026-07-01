@@ -913,7 +913,10 @@ class DMXEngine:
 
         bloom_brightness = 0.0
         if self._ab_bloom_active:
-            age = t - self._ab_bloom_t0
+            # Clamp against backward time jumps (e.g. a synced-mode seek while
+            # a bloom is mid-swell) -- without this, a negative age feeds an
+            # unclamped smoothstep and can spike brightness far outside [0,1].
+            age = max(0.0, t - self._ab_bloom_t0)
             total = ABYSSAL_BLOOM_RISE + ABYSSAL_BLOOM_HOLD + ABYSSAL_BLOOM_FALL
             if age >= total:
                 self._ab_bloom_active = False
@@ -947,7 +950,8 @@ class DMXEngine:
 
         glint_brightness = 0.0
         if self._ab_glint_active:
-            age = t - self._ab_glint_t0
+            # Same backward-seek guard as the bloom block above.
+            age = max(0.0, t - self._ab_glint_t0)
             total = ABYSSAL_GLINT_RISE + ABYSSAL_GLINT_FALL
             if age >= total:
                 self._ab_glint_active = False
