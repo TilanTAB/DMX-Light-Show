@@ -17,7 +17,7 @@ The ambient/chill renderer family has four members — `ocean_drift` (cool water
 ## Non-goals
 
 - No new fixture support — single 8-channel RGBW par (master/R/G/B/W/strobe), like every other renderer.
-- No engine refactor. This branch is off `main`, where the engines are **still duplicated**; we accept that and add the renderer to both files (see Integration). The dedup refactor lives on a separate branch/PR and is out of scope here.
+- No engine refactor. This branch is off `main` at the **pre-split monolith** — `music_light.py` alone contains both loopback and synced playback (dispatched via `is_loopback = elapsed_seconds is None` inside one shared `process_audio`, launched via a `--mode` flag). There is only one file, one `_behavior_map`, one `VALID_BEHAVIORS`. (A *later* branch/PR splits this into two files and then a shared base — out of scope here; corrected from an earlier draft of this spec that wrongly assumed the split already existed on `main`.)
 - No strobe — this is a calm renderer; `out_strobe` stays 0.
 
 ## Decisions (from brainstorming)
@@ -64,29 +64,29 @@ Only one bloom **or** glint active at a time; a hard `bloom_gap` floor (≈ 3 s 
 ### `bass_activity`
 A smoothed bass measure, not a raw transient: `self._ab_bass = ema(self._ab_bass, min(1.0, kick_i), 0.2, 0.05)`. Smoothing means a single kick doesn't whipsaw the bloom rate; a sustained bass passage ramps it. (`kick_i` is still used raw for the instantaneous bloom *nudge*.)
 
-### Parameters (module-level constants — not `profile_*`, to avoid adding `load_profile` keys to both files)
+### Parameters (module-level constants — not `profile_*`, to avoid adding new `load_profile` keys)
 `FLOOR_MIN=0.03`, `FLOOR_MAX=0.10`, `BLOOM_BASE=0.45`, `BLOOM_MAX=0.70`, `BLOOM_BASS_GAIN=0.25`, `BLOOM_RISE=1.5`, `BLOOM_HOLD=0.4`, `BLOOM_FALL=3.5`, `BLOOM_GAP_MIN=3.0`, `BLOOM_INTERVAL=11.0`, `BLOOM_NUDGE_THRESH=0.25`, `GLINT_INTERVAL=18.0`, `GLINT_THRESH=0.5`. (Tunable during implementation against the hardware.)
 
 ## The "more reactive" vs "deep & sparse" tension
 
 The user chose *more reactive* over the subtler default. Bass couples in two bounded ways: it **shortens the inter-bloom interval** (`interval * (1 - bass_activity*0.6)`, floored at `BLOOM_GAP_MIN`) and **raises peak bloom brightness** (capped at `BLOOM_MAX`). The bounds (min-gap + brightness cap + single-event guard) are deliberately what stop a loud passage from turning this into `beat_reactive`. If, on hardware, it still feels too busy, the single knob to turn is `BLOOM_GAP_MIN` up / `BLOOM_BASS_GAIN` down. This is the main thing to validate by eye.
 
-## Integration (both engine files — duplicated on `main`)
+## Integration (single file, single class — pre-split `music_light.py`)
 
-The renderer and its registration must be added to **both** `music_light.py` and `ai_show_player.py` (no shared module on this branch). Per file:
-1. The `_render_abyssal_bloom` method.
-2. New `self._ab_*` state vars in `__init__`.
-3. `_behavior_map["abyssal_bloom"] = self._render_abyssal_bloom`.
-4. `VALID_BEHAVIORS` add `"abyssal_bloom"`.
-5. The loopback `ambient_behaviors` set (so loopback routes it to the standard renderer, not `_render_loopback_direct`) — *music_light only*.
-6. The loopback `_detect_auto_behavior` `ambient_pool` (so it auto-selects at very-low energy) — *music_light only*.
+Six registration points, **all in `music_light.py`** (confirmed: `VALID_BEHAVIORS` at line 63, `_behavior_map` in `__init__` at line 224, `ambient_behaviors` in the loopback branch of `process_audio` at line 1245, `ambient_pool` inside `_detect_auto_behavior` at line 1021):
+1. `VALID_BEHAVIORS` — add `"abyssal_bloom"`.
+2. New `self._ab_*` state vars in `__init__` (alongside the other loopback-direct state, e.g. near `self.peak_kick`).
+3. The `_render_abyssal_bloom` method itself.
+4. `_behavior_map["abyssal_bloom"] = self._render_abyssal_bloom` — this single map is read by **both** the loopback and synced branches of `process_audio` (confirmed at lines 1252 and 1279), so this one entry makes it playable in both modes without further branching.
+5. The loopback `ambient_behaviors` set (line 1245) — so loopback routes it to the standard renderer dispatch, not `_render_loopback_direct`.
+6. The loopback `_detect_auto_behavior` `ambient_pool` (line 1021) — so it's auto-selected at very-low energy.
 
-Plus **one shared, non-duplicated** change: add an `abyssal_bloom` entry to the `=== AMBIENT / CHILL BEHAVIORS ===` section of the prompt in `llm_designer.py`, so the LLM can assign it.
+Plus one change in `llm_designer.py`: add an `abyssal_bloom` entry to the `=== AMBIENT / CHILL BEHAVIORS ===` section of the prompt, so the LLM can assign it in synced shows.
 
 ## Data flow per frame
-1. Engine `process_audio` computes `kick_i…volume`, picks behavior (`_detect_auto_behavior` in loopback, cue lookup in synced), and dispatches to `_render_abyssal_bloom` with the cue + `t`.
+1. `process_audio` computes `kick_i…volume`, then branches on `is_loopback`: the loopback branch calls `_detect_auto_behavior` (which can return `"abyssal_bloom"` from the `ambient_pool` rotation) and, since it's in `ambient_behaviors`, dispatches via `_behavior_map` with a synthetic cue; the synced branch looks up the active cue and dispatches via the same `_behavior_map` if the cue's `behavior == "abyssal_bloom"`.
 2. The renderer advances its floor sines, the bloom/glint state machines (reading `kick_i`/`hihat_i` for reactivity), composes the layers, and sets `self.out_*`.
-3. Engine sends the frame via `send_dmx`.
+3. `process_audio` sends the frame via `send_dmx` (one call, after the `if/else` branch).
 
 ## Error handling / edge cases
 - Defensive cue access (`cue.get("dimmer", 50) if cue else 50`) — matches the other renderers; loopback passes a synthetic cue.
@@ -95,11 +95,11 @@ Plus **one shared, non-duplicated** change: add an `abyssal_bloom` entry to the 
 
 ## Testing / verification
 `main` has **no test harness**, and the renderer needs the uDMX + audio to see. Verify by:
-- **Loopback:** run with `--profile profiles/chill_ambient.json`, play quiet/ambient audio, confirm the energy machine drops to `calm` and rotates `abyssal_bloom` into the `ambient_pool`; eyeball the dark-floor-with-rare-blooms feel and that loud bass makes blooms more frequent **but still gapped**.
-- **Synced:** hand-author or generate a `show.json` with an `abyssal_bloom` cue on an intro/breakdown; confirm it renders.
+- **Loopback:** `python music_light.py --mode loopback --profile profiles/chill_ambient.json`, play quiet/ambient audio, confirm the energy machine drops to `calm` and rotates `abyssal_bloom` into the `ambient_pool`; eyeball the dark-floor-with-rare-blooms feel and that loud bass makes blooms more frequent **but still gapped**.
+- **Synced:** hand-author or generate a `show.json` with an `abyssal_bloom` cue on an intro/breakdown, then `python music_light.py --mode synced --show shows/<id>/show.json`; confirm it renders.
 - (Optional, low-cost) a tiny offline driver that calls `_render_abyssal_bloom` over synthetic `t`/`kick_i` and prints `out_*` to confirm the floor stays dim and blooms are gapped — no hardware needed.
 
 ## Risks
 1. **Reactivity vs. calm.** The chosen "more reactive" coupling is the main way this could miss the brief — a busy room instead of a deep one. Mitigated by the bounds; validated by eye; one-knob fix.
-2. **Double-maintenance on `main`.** Six registration points × two files = easy to half-wire (e.g., add to `music_light` but forget `ai_show_player`). The implementation plan must check both. (This is exactly the duplication the other branch removes.)
-3. **State on a stateless-ish pattern.** The bloom/glint envelopes add per-instance state the other ambient renderers don't have; it must be initialised in both `__init__`s or the first frame throws `AttributeError`.
+2. **Six registration points, one file.** Easy to add the renderer but forget one of `VALID_BEHAVIORS` / `_behavior_map` / `ambient_behaviors` / `ambient_pool` / `__init__` state — each omission fails differently (KeyError, AttributeError, or silent non-selection). The implementation plan must check all six explicitly.
+3. **Shared per-instance state.** The bloom/glint envelopes add `self._ab_*` fields the other ambient renderers don't have; must be initialised in `__init__` or the first frame throws `AttributeError`.
