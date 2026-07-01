@@ -66,6 +66,12 @@ ABYSSAL_GLINT_FALL = 0.6
 ABYSSAL_GLINT_INTERVAL = 18.0
 ABYSSAL_GLINT_THRESH = 0.5
 
+ABYSSAL_DISCONTINUITY_THRESHOLD = 1.0  # seconds; a real audio-frame-to-frame
+# gap while this behavior stays selected is ~0.01s. Anything bigger means
+# this renderer was skipped (ambient_pool rotated away and back) or a seek
+# happened -- either way, treat it as "just arrived" so blooms/glints reset
+# to rare instead of firing instantly.
+
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
     ((255, 0, 50), (0, 150, 255)),     # Red vs Blue
@@ -201,6 +207,7 @@ class DMXEngine:
         self._ab_glint_active = False
         self._ab_glint_t0 = 0.0
         self._ab_last_glint_t = -999.0
+        self._ab_last_render_t = None      # last t this renderer was actually called with (None = never)
 
         # SYNC FIX: Pre-cached Hanning windows keyed by block size.
         self._hanning_cache = {}
@@ -879,6 +886,20 @@ class DMXEngine:
         teal blooms, rarer white glints. Restraint is the effect — only one
         bloom or glint active at a time, with a hard minimum gap between blooms
         regardless of bass energy."""
+        # Self-healing reset: if this renderer wasn't called recently (skipped
+        # while another ambient behavior was selected) or `t` jumped (a synced
+        # seek in either direction), treat it as a fresh arrival rather than
+        # letting stale timers fire an instant bloom/glint or desync for tens
+        # of seconds. Covers both the loopback re-entry case and the seek case
+        # with one mechanism -- no dispatch-layer changes needed.
+        if (self._ab_last_render_t is None or
+                abs(t - self._ab_last_render_t) > ABYSSAL_DISCONTINUITY_THRESHOLD):
+            self._ab_bloom_active = False
+            self._ab_glint_active = False
+            self._ab_last_bloom_t = t
+            self._ab_last_glint_t = t
+        self._ab_last_render_t = t
+
         dimmer = (cue.get("dimmer", 50) if cue else 50) / 100.0
 
         # --- Smoothed bass activity (not the raw per-frame kick_i) ---
