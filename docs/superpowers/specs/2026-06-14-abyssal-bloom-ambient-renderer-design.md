@@ -71,17 +71,19 @@ A smoothed bass measure, not a raw transient: `self._ab_bass = ema(self._ab_bass
 
 The user chose *more reactive* over the subtler default. Bass couples in two bounded ways: it **shortens the inter-bloom interval** (`interval * (1 - bass_activity*0.6)`, floored at `BLOOM_GAP_MIN`) and **raises peak bloom brightness** (capped at `BLOOM_MAX`). The bounds (min-gap + brightness cap + single-event guard) are deliberately what stop a loud passage from turning this into `beat_reactive`. If, on hardware, it still feels too busy, the single knob to turn is `BLOOM_GAP_MIN` up / `BLOOM_BASS_GAIN` down. This is the main thing to validate by eye.
 
-## Integration (single file, single class — pre-split `music_light.py`)
+## Integration (8 touch points across 2 files)
 
-Six registration points, **all in `music_light.py`** (confirmed: `VALID_BEHAVIORS` at line 63, `_behavior_map` in `__init__` at line 224, `ambient_behaviors` in the loopback branch of `process_audio` at line 1245, `ambient_pool` inside `_detect_auto_behavior` at line 1021):
-1. `VALID_BEHAVIORS` — add `"abyssal_bloom"`.
-2. New `self._ab_*` state vars in `__init__` (alongside the other loopback-direct state, e.g. near `self.peak_kick`).
+**`music_light.py`** (6 points; confirmed line numbers):
+1. `VALID_BEHAVIORS` (line 63) — add `"abyssal_bloom"`.
+2. New `self._ab_*` state vars in `__init__` (alongside the other loopback-direct state, e.g. near `self.peak_kick` at line 173).
 3. The `_render_abyssal_bloom` method itself.
-4. `_behavior_map["abyssal_bloom"] = self._render_abyssal_bloom` — this single map is read by **both** the loopback and synced branches of `process_audio` (confirmed at lines 1252 and 1279), so this one entry makes it playable in both modes without further branching.
+4. `_behavior_map["abyssal_bloom"] = self._render_abyssal_bloom` (in `__init__`, line 224) — this single map is read by **both** the loopback and synced branches of `process_audio` (confirmed at lines 1252 and 1279), so this one entry makes it playable in both modes without further branching.
 5. The loopback `ambient_behaviors` set (line 1245) — so loopback routes it to the standard renderer dispatch, not `_render_loopback_direct`.
 6. The loopback `_detect_auto_behavior` `ambient_pool` (line 1021) — so it's auto-selected at very-low energy.
 
-Plus one change in `llm_designer.py`: add an `abyssal_bloom` entry to the `=== AMBIENT / CHILL BEHAVIORS ===` section of the prompt, so the LLM can assign it in synced shows.
+**`llm_designer.py`** (2 points — a *second, separate* `VALID_BEHAVIORS` lives here, confirmed at line 351, distinct from `music_light.py`'s):
+7. The `=== AMBIENT / CHILL BEHAVIORS ===` prompt text (around line 178) — so the LLM knows the option exists and picks it.
+8. `VALID_BEHAVIORS` (line 351) — this gates `_validate_and_repair_plan` (line 394): if a behavior isn't in this set, it's **silently rewritten to `beat_reactive`**. Missing this step means the LLM could pick `abyssal_bloom` and have it silently downgraded with no error — the exact kind of failure to avoid.
 
 ## Data flow per frame
 1. `process_audio` computes `kick_i…volume`, then branches on `is_loopback`: the loopback branch calls `_detect_auto_behavior` (which can return `"abyssal_bloom"` from the `ambient_pool` rotation) and, since it's in `ambient_behaviors`, dispatches via `_behavior_map` with a synthetic cue; the synced branch looks up the active cue and dispatches via the same `_behavior_map` if the cue's `behavior == "abyssal_bloom"`.
@@ -101,5 +103,5 @@ Plus one change in `llm_designer.py`: add an `abyssal_bloom` entry to the `=== A
 
 ## Risks
 1. **Reactivity vs. calm.** The chosen "more reactive" coupling is the main way this could miss the brief — a busy room instead of a deep one. Mitigated by the bounds; validated by eye; one-knob fix.
-2. **Six registration points, one file.** Easy to add the renderer but forget one of `VALID_BEHAVIORS` / `_behavior_map` / `ambient_behaviors` / `ambient_pool` / `__init__` state — each omission fails differently (KeyError, AttributeError, or silent non-selection). The implementation plan must check all six explicitly.
+2. **Eight registration points across two files.** Easy to add the renderer but forget one of `VALID_BEHAVIORS` (×2, one per file) / `_behavior_map` / `ambient_behaviors` / `ambient_pool` / `__init__` state / the prompt text — each omission fails differently (KeyError, AttributeError, silent non-selection, or — worst — a silent downgrade to `beat_reactive` via `llm_designer.py`'s repair step). The implementation plan must check all eight explicitly.
 3. **Shared per-instance state.** The bloom/glint envelopes add `self._ab_*` fields the other ambient renderers don't have; must be initialised in `__init__` or the first frame throws `AttributeError`.
