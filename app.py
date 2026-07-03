@@ -7,6 +7,7 @@ Run with: python app.py
 Auto-docs: http://localhost:8000/docs
 """
 import os
+import sys
 import re
 import json
 import time
@@ -17,6 +18,7 @@ import logging
 import wave
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 
@@ -62,14 +64,48 @@ app.add_middleware(
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# PyInstaller frozen-mode detection: when packaged, sys.frozen is True and
+# sys._MEIPASS points to the temporary extraction directory for bundled data.
+# We need BASE_DIR to be the *real* directory the exe lives in (for shows/,
+# profiles/, .env, ffmpeg.exe etc.), NOT the temp extraction dir.
+IS_FROZEN = getattr(sys, 'frozen', False)
+if IS_FROZEN:
+    # In frozen mode: exe lives in dist/dmx_app/
+    BASE_DIR = os.path.dirname(sys.executable)
+    _BUNDLE_DIR = sys._MEIPASS  # Bundled read-only data (frontend/dist, etc.)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    _BUNDLE_DIR = BASE_DIR
+
 SHOWS_DIR = os.path.join(BASE_DIR, "shows")
 AUDIO_DIR = os.path.join(BASE_DIR, "youtube_audio")
-PYTHON_EXE = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
 PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
 
 os.makedirs(SHOWS_DIR, exist_ok=True)
 os.makedirs(PROFILES_DIR, exist_ok=True)
+
+
+def _get_worker_cmd(script_name: str, extra_args: list[str] | None = None) -> list[str]:
+    """
+    Build the subprocess command to launch a worker script.
+    
+    In development: ['path/to/.venv/Scripts/python.exe', 'script.py', ...]
+    In frozen mode:  ['path/to/dist/dmx_app/script_worker.exe', ...]
+    
+    This abstraction lets app.py run identically in both environments
+    without any caller needing to know about PyInstaller.
+    """
+    if IS_FROZEN:
+        # Workers are compiled as separate executables in the same directory
+        worker_name = script_name.replace('.py', '_worker.exe')
+        cmd = [os.path.join(BASE_DIR, worker_name)]
+    else:
+        python_exe = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
+        cmd = [python_exe, script_name]
+    if extra_args:
+        cmd.extend(extra_args)
+    return cmd
 
 # ==========================================
 # GLOBAL STATE (process tracking)
@@ -417,7 +453,7 @@ def generate_show(req: GenerateRequest):
             os.remove(current)
             logger.info("Removed stale current_show.json")
         
-        cmd = [PYTHON_EXE, "-u", "youtube_analyzer.py"]
+        cmd = _get_worker_cmd("youtube_analyzer.py", ["-u"] if not IS_FROZEN else None)
         
         if existing and existing.get("audio_file") and os.path.exists(existing["audio_file"]):
             with _generation_lock:
@@ -613,30 +649,29 @@ def play_show(req: PlayRequest):
     with _active_lock:
         _kill_active_process()
         global _active_process
-        _active_process = subprocess.Popen(
-            [PYTHON_EXE, "music_light.py", "--mode", "synced", "--show", show_file],
-            cwd=BASE_DIR
-        )
-    return {"message": f"Playing '{req.show_id}' (synced mode)", "pid": _active_process.pid}
+        cmd = _get_worker_cmd("ai_show_player.py", ["--show", show_file])
+        _active_process = subprocess.Popen(cmd, cwd=BASE_DIR)
+    return {"message": f"Playing '{req.show_id}' (AI show)", "pid": _active_process.pid}
 
 
 @app.post("/api/loopback")
 def start_loopback(req: LoopbackRequest):
     """Start live WASAPI loopback capture mode."""
-    cmd = [PYTHON_EXE, "music_light.py", "--mode", "loopback"]
+    extra = []
 
     if req.show_id:
         show_dir = _resolve_show_path(req.show_id)
         show_file = os.path.join(show_dir, "show.json")
         if os.path.isfile(show_file):
-            cmd.extend(["--show", show_file])
+            extra.extend(["--show", show_file])
 
     # Add profile if specified
     if req.profile_id:
         profile_path = os.path.join(PROFILES_DIR, req.profile_id + ".json")
         if os.path.isfile(profile_path):
-            cmd.extend(["--profile", profile_path])
+            extra.extend(["--profile", profile_path])
 
+    cmd = _get_worker_cmd("music_light.py", extra)
     with _active_lock:
         _kill_active_process()
         global _active_process
@@ -826,7 +861,7 @@ def activate_profile(profile_id: str):
         raise HTTPException(404, f"Profile '{profile_id}' not found")
 
     # Restart loopback with this profile
-    cmd = [PYTHON_EXE, "music_light.py", "--mode", "loopback", "--profile", profile_path]
+    cmd = _get_worker_cmd("music_light.py", ["--profile", profile_path])
 
     with _active_lock:
         _kill_active_process()
@@ -841,6 +876,20 @@ def activate_profile(profile_id: str):
 # ==========================================
 # STARTUP
 # ==========================================
+# ==========================================
+# STATIC FRONTEND SERVING
+# Mount the production React build at "/" so the API + UI are served
+# from a single origin. This MUST be after all /api/* routes so
+# FastAPI's route matching checks API routes first.
+# ==========================================
+_FRONTEND_DIR = os.path.join(_BUNDLE_DIR, "frontend", "dist")
+if os.path.isdir(_FRONTEND_DIR):
+    app.mount("/", StaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend")
+    logger.info(f"[STARTUP] Serving frontend from: {_FRONTEND_DIR}")
+else:
+    logger.warning(f"[STARTUP] Frontend build not found at {_FRONTEND_DIR} — UI will not be served.")
+
+
 if __name__ == "__main__":
     # I6 FIX: Build video index on startup
     _build_video_index()
@@ -854,9 +903,18 @@ if __name__ == "__main__":
         except ValueError as e:
             print(f"[WARN] Auto-import failed: {e}")
 
+    mode_label = "PACKAGED" if IS_FROZEN else "DEV"
     print("=" * 50)
-    print("  DMX Show Manager API (FastAPI)")
+    print(f"  DMX Show Manager API ({mode_label})")
+    print("  UI:   http://localhost:8000")
     print("  API:  http://localhost:8000/api/shows")
     print("  Docs: http://localhost:8000/docs")
     print("=" * 50)
+
+    # Auto-open browser when running as packaged app
+    if IS_FROZEN:
+        import webbrowser
+        import threading
+        threading.Timer(1.5, lambda: webbrowser.open("http://localhost:8000")).start()
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
