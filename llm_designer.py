@@ -305,6 +305,10 @@ Use these for quiet sections, breakdowns, lo-fi, acoustic, and ambient music.
   USE FOR: Ambient electronic, chillwave, post-rock, atmospheric sections.
   FEEL: Ethereal, mesmerizing. Like northern lights.
 
+"abyssal_bloom" — Near-black drifting floor with rare, slow teal blooms that swell and dissolve, and rarer white glints. Bass makes blooms more frequent and slightly brighter, but never lets it get busy.
+  USE FOR: Deep breakdowns, the quietest intros/outros, meditative or minimal-techno sections.
+  FEEL: Vast, restrained, oceanic-depths. Darkness as the canvas.
+
 === NARRATIVE ARC TEMPLATE ===
 A well-designed show follows this emotional curve:
   Intro: ocean_drift or aurora_shimmer (gentle, mysterious)
@@ -445,7 +449,7 @@ VALID_BEHAVIORS = {
     "static_wash", "rainbow_sweep", "buildup_ramp", "instant_flash",
     "beat_reactive", "bass_white_blast", "blackout_punch",
     # Ambient/chill behaviors
-    "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer",
+    "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
 }
 
 
