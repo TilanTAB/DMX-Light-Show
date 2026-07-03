@@ -540,12 +540,13 @@ if __name__ == "__main__":
         "spectral_timeline_points": len(telemetry.get("spectral_timeline", []))
     }, indent=2))
     
-    # Step 2: Send telemetry to Azure OpenAI GPT-5 Nano
-    print("\n[+] Sending telemetry to Azure OpenAI 'GPT-5 Nano'...")
+    # Step 2: Send telemetry to the configured LLM provider
+    # (get_gpt_lighting_plan announces the provider/model itself)
+    _llm_provider = os.getenv("LLM_PROVIDER", "azure").upper()
     ai_plan = llm_designer.get_gpt_lighting_plan(telemetry)
-    
+
     if ai_plan:
-        print("\n[==== AZURE AI DMX LIGHTING SCRIPT ====]")
+        print(f"\n[==== {_llm_provider} DMX LIGHTING SCRIPT ====]")
         print(json.dumps(ai_plan, indent=2))
         
         # Step 3: Save the show to current_show.json
