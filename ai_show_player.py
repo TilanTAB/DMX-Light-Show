@@ -51,6 +51,30 @@ class DMXEngine(DmxEngineBase):
             behaviors = set(c["behavior"] for c in self.synced_cues)
             logger.info(f"[SYNCED] {len(self.synced_cues)} cues, behaviors: {behaviors}")
 
+        from dmx_engine import DRY_RUN
+        if DRY_RUN:
+            wf = wave_mod.open(audio_path, 'rb')
+            sample_rate = wf.getframerate()
+            frames_played = 0
+            last_cue = None
+            data = wf.readframes(BLOCK_SIZE)
+            while data:
+                elapsed = frames_played / sample_rate
+                self.process_audio(data, elapsed_seconds=elapsed,
+                                   input_format="int16", actual_sample_rate=sample_rate)
+                cue = self._get_active_cue(elapsed)
+                name = cue["name"] if cue else None
+                if name != last_cue:
+                    last_cue = name
+                    logger.info(f"[DRY {elapsed:6.1f}s] cue={name} "
+                                f"palette={self.variety.current_palette['id']} "
+                                f"frame={self.last_frame}")
+                frames_played += BLOCK_SIZE
+                data = wf.readframes(BLOCK_SIZE)
+            wf.close()
+            logger.info("[DRY-RUN] Completed synced pass.")
+            return
+
         wf = wave_mod.open(audio_path, 'rb')
         p = pyaudio.PyAudio()
         stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),

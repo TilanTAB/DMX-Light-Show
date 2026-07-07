@@ -17,6 +17,10 @@ import queue
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Offline verification: DMX_DRY_RUN=1 skips USB init and records frames on
+# self.last_frame instead of transferring. Used by the dry-run playback branch.
+DRY_RUN = os.getenv("DMX_DRY_RUN") == "1"
+
 # ==========================================
 # CONSTANTS (immutable — safe at module level)
 # ==========================================
@@ -176,6 +180,7 @@ class DmxEngineBase:
         self._cue_starts = []
         self.show_bpm = 0.0
         self.audio_file = None
+        self.last_frame = None             # populated only in DRY_RUN mode
         # FFT caches
         self._hanning_cache = {}
         self._fft_freq_cache = {}
@@ -241,6 +246,10 @@ class DmxEngineBase:
 
     def _init_hardware(self):
         """Find uDMX adapter. Raises RuntimeError if not found."""
+        if DRY_RUN:
+            logger.info("[DRY-RUN] Skipping uDMX init; frames recorded, not sent.")
+            self.dev = None
+            return
         self.dev = usb.core.find(idVendor=0x16C0, idProduct=0x05DC)
         if self.dev is None:
             raise RuntimeError("uDMX not found! Please connect the adapter.")
@@ -272,6 +281,9 @@ class DmxEngineBase:
                 logger.error(f"[DMX WORKER] Error: {ex}")
 
     def send_dmx(self, master, red, green, blue, white=0, strobe=0):
+        if DRY_RUN:
+            self.last_frame = (int(master), int(red), int(green), int(blue), int(white), int(strobe))
+            return
         # S2: Apply gamma correction to color channels for perceptually linear fading.
         # Master/strobe stay linear (they're intensity controls, not color output).
         data = [
