@@ -445,13 +445,15 @@ def analyze_audio_structure(filepath):
     return telemetry
 
 
-def save_show(ai_plan, audio_filepath):
+def save_show(ai_plan, audio_filepath, song_metrics=None):
     """
-    Saves the AI-generated lighting plan and audio file path to current_show.json
-    so music_light.py can load it and play the show in perfect sync.
+    Saves the AI-generated lighting plan, audio file path, and song metrics
+    (bpm, etc.) to current_show.json so music_light.py can load it and play
+    the show in perfect sync.
     """
     show_data = {
         "audio_file": os.path.abspath(audio_filepath),
+        "song_metrics": song_metrics or {},
         "lighting_plan": ai_plan
     }
     with open(SHOW_FILE, 'w') as f:
@@ -550,7 +552,7 @@ if __name__ == "__main__":
         print(json.dumps(ai_plan, indent=2))
         
         # Step 3: Save the show to current_show.json
-        save_show(ai_plan, audio_file)
+        save_show(ai_plan, audio_file, telemetry.get("song_metrics"))
         
         print(f"\n[+] Ready! Run 'python music_light.py' to start the synchronized show.")
     else:

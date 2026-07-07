@@ -145,6 +145,7 @@ def bloom_attack(current, target, speed=0.85):
 # ============================================================
 
 import bisect
+import zlib
 from dmx_variety import VarietyEngine
 
 
@@ -850,6 +851,15 @@ class DmxEngineBase:
                 data = json.load(f)
 
             plan = data.get("lighting_plan", {})
+
+            # Per-song identity. NOT builtin hash(): Python salts string hashes
+            # per process, and every playback is a fresh worker process, so
+            # hash() would silently break same-song-same-look replay
+            # determinism. zlib.crc32 is stdlib and process-stable.
+            metrics = data.get("song_metrics", {}) or plan.get("song_metrics", {})
+            self.show_bpm = float(metrics.get("bpm", 0.0) or 0.0)
+            seed_basis = plan.get("show_name") or data.get("audio_file") or ""
+            self.variety.set_song_seed(zlib.crc32(seed_basis.encode("utf-8")))
 
             phrases = plan.get("phrases", [])
             if phrases:
