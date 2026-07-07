@@ -31,7 +31,6 @@ def _write_show(dirpath, name="Test Song"):
 def _palette_run(show_path, n=4):
     engine = DmxEngineBase()
     engine.load_ai_show(show_path)
-    assert engine.show_bpm == 128.0, "bpm must be read from the show file"
     return [engine.variety.begin_section(
                 Intent(energy=8, mood=None, section_id=str(i), is_new_section=True)
             )["id"] for i in range(n)]
@@ -51,3 +50,37 @@ def test_different_shows_can_diverge():
         a = _palette_run(_write_show(d1, name="Song A"), n=6)
         b = _palette_run(_write_show(d2, name="Song B"), n=6)
         assert a != b
+
+
+def test_bpm_is_read_from_show_file():
+    with tempfile.TemporaryDirectory() as d:
+        engine = DmxEngineBase()
+        engine.load_ai_show(_write_show(d))
+        assert engine.show_bpm == 128.0
+
+
+def test_malformed_bpm_degrades_without_killing_the_load():
+    # One bad metadata field must NOT abort cue/palette loading (repair-don't-
+    # reject convention). Reproduced pre-fix: float("abc") aborted everything.
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_show(d)
+        show = json.load(open(path))
+        show["song_metrics"] = {"bpm": "abc"}
+        json.dump(show, open(path, "w"))
+        engine = DmxEngineBase()
+        result = engine.load_ai_show(path)
+        assert result == "x.wav"                 # load completed, not aborted
+        assert len(engine.synced_cues) == 1      # cues survived
+        assert engine.show_bpm == 0.0            # degraded, not crashed
+
+
+def test_non_dict_song_metrics_ignored():
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_show(d)
+        show = json.load(open(path))
+        show["song_metrics"] = "corrupt"
+        json.dump(show, open(path, "w"))
+        engine = DmxEngineBase()
+        engine.load_ai_show(path)
+        assert engine.show_bpm == 0.0
+        assert len(engine.synced_cues) == 1

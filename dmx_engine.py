@@ -856,9 +856,25 @@ class DmxEngineBase:
             # per process, and every playback is a fresh worker process, so
             # hash() would silently break same-song-same-look replay
             # determinism. zlib.crc32 is stdlib and process-stable.
-            metrics = data.get("song_metrics", {}) or plan.get("song_metrics", {})
-            self.show_bpm = float(metrics.get("bpm", 0.0) or 0.0)
-            seed_basis = plan.get("show_name") or data.get("audio_file") or ""
+            # Guarded independently: malformed metadata must degrade (bpm 0.0 =
+            # time-based phrasing), never abort loading the cues/palettes below.
+            metrics = data.get("song_metrics", {})
+            if not isinstance(metrics, dict):
+                logger.warning(f"Malformed song_metrics ({type(metrics).__name__}); ignoring")
+                metrics = {}
+            try:
+                self.show_bpm = float(metrics.get("bpm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                logger.warning(f"Malformed song_metrics.bpm ({metrics.get('bpm')!r}); "
+                               "falling back to 0.0 (time-based phrasing)")
+                self.show_bpm = 0.0
+            name = plan.get("show_name")
+            audio = data.get("audio_file")
+            # basename, not abspath: seed must not change when the install
+            # moves drives/folders (app.py's slug convention does the same).
+            seed_basis = (name if isinstance(name, str) and name
+                          else os.path.basename(audio) if isinstance(audio, str) and audio
+                          else "")
             self.variety.set_song_seed(zlib.crc32(seed_basis.encode("utf-8")))
 
             phrases = plan.get("phrases", [])
