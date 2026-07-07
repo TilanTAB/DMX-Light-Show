@@ -5,6 +5,7 @@ import time
 import logging
 import pyaudiowpatch as pyaudio
 from dmx_engine import DmxEngineBase, BLOCK_SIZE, DRY_RUN
+from dmx_variety import Intent
 
 logger = logging.getLogger(__name__)
 
@@ -17,21 +18,29 @@ class DMXEngine(DmxEngineBase):
                   kick_i, snare_i, hihat_i, mid_i,
                   is_kick, is_snare, volume, sr, elapsed_seconds=None):
         t = elapsed_seconds
-        # Palette rotation every 16 beats (was inline in the old process_audio)
-        if (is_kick or is_snare) and self.total_beat_count % 16 == 0:
-            self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
 
-        if self.synced_cues:
-            cue = self._get_active_cue(elapsed_seconds)
-            if cue:
-                kick_color = cue["color_1"]; accent_color = cue["color_2"]
-                behavior = cue.get("behavior", "beat_reactive")
-            else:
-                kick_color, accent_color = self.palettes[self.current_palette_idx]
-                behavior = "beat_reactive"; cue = None
+        cue = self._get_active_cue(elapsed_seconds) if self.synced_cues else None
+        if cue:
+            behavior = cue.get("behavior", "beat_reactive")
+            section_id = cue.get("name", "")
+            energy = int(cue.get("energy", 5))
+            mood = cue.get("mood")
+            strobe_allowed = bool(cue.get("strobe", False))
+            seed_color = list(cue.get("color_1", (255, 255, 255)))
         else:
-            kick_color, accent_color = self.palettes[self.current_palette_idx]
-            behavior = "beat_reactive"; cue = None
+            behavior, section_id = "beat_reactive", "_fallback"
+            energy, mood, strobe_allowed, seed_color = 7, None, False, None
+
+        # Variety layer: LLM cue supplies intent (energy/mood/color seed); the
+        # engine owns final color, anti-repeat, and phrase-grid texture.
+        self.variety.tick(is_beat=(is_kick or is_snare), bpm=self.show_bpm, t=t)
+        if section_id != self._last_section_id:
+            self._last_section_id = section_id
+            self.variety.begin_section(Intent(
+                energy=energy, mood=mood, section_id=section_id,
+                is_new_section=True, bpm=self.show_bpm,
+                strobe_allowed=strobe_allowed, seed_color=seed_color))
+        kick_color, accent_color, _accent = self.variety.current_colors()
 
         renderer = self._behavior_map.get(behavior, self._render_beat_reactive)
         renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
