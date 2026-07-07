@@ -8,7 +8,8 @@ from collections import deque
 import numpy as np
 import pyaudiowpatch as pyaudio
 from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
-                        LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH)
+                        LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
+                        DRY_RUN)
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +342,15 @@ class DMXEngine(DmxEngineBase):
             )
 
     def run_loopback_mode(self, show_file=None):
+        if DRY_RUN:
+            # The DRY_RUN offline harness is synced-only. Loopback under this
+            # flag would still open a live WASAPI stream but silently discard
+            # every DMX frame with no diagnostic output -- warn loudly so a
+            # leftover env var (inherited through app.py's subprocess spawn)
+            # can't masquerade as "lights mysteriously dead".
+            logger.warning("[DRY-RUN] DMX_DRY_RUN=1 is set: loopback will run "
+                           "WITHOUT hardware output (frames discarded). This "
+                           "harness is intended for synced-mode verification only.")
         self._init_hardware()
         if show_file:
             self.load_ai_show(show_file)
