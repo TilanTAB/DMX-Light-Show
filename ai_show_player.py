@@ -20,26 +20,33 @@ class DMXEngine(DmxEngineBase):
         t = elapsed_seconds
 
         cue = self._get_active_cue(elapsed_seconds) if self.synced_cues else None
-        if cue:
-            behavior = cue.get("behavior", "beat_reactive")
-            section_id = cue.get("name", "")
-            energy = int(cue.get("energy", 5))
-            mood = cue.get("mood")
-            strobe_allowed = bool(cue.get("strobe", False))
-            seed_color = list(cue.get("color_1", (255, 255, 255)))
-        else:
-            behavior, section_id = "beat_reactive", "_fallback"
-            energy, mood, strobe_allowed, seed_color = 7, None, False, None
+        behavior = cue.get("behavior", "beat_reactive") if cue else "beat_reactive"
 
         # Variety layer: LLM cue supplies intent (energy/mood/color seed); the
         # engine owns final color, anti-repeat, and phrase-grid texture.
         self.variety.tick(is_beat=(is_kick or is_snare), bpm=self.show_bpm, t=t)
-        if section_id != self._last_section_id:
-            self._last_section_id = section_id
-            self.variety.begin_section(Intent(
-                energy=energy, mood=mood, section_id=section_id,
-                is_new_section=True, bpm=self.show_bpm,
-                strobe_allowed=strobe_allowed, seed_color=seed_color))
+        if cue:
+            # Composite key: keying on the name alone would suppress the
+            # palette change between two ADJACENT same-named cues (nothing in
+            # the LLM prompt or repair forbids them).
+            section_id = f'{cue.get("start", 0)}:{cue.get("name", "")}'
+            if section_id != self._last_section_id:
+                self._last_section_id = section_id
+                try:
+                    energy = int(cue.get("energy", 5))
+                except (TypeError, ValueError):
+                    # Library shows replay without re-running the LLM repair;
+                    # a hand-edited/legacy file must not kill playback.
+                    energy = 5
+                self.variety.begin_section(Intent(
+                    energy=energy, mood=cue.get("mood"), section_id=section_id,
+                    is_new_section=True, bpm=self.show_bpm,
+                    strobe_allowed=bool(cue.get("strobe", False)),
+                    seed_color=list(cue.get("color_1", (255, 255, 255)))))
+        # No begin_section during between-cue gaps: sub-0.5s gaps survive the
+        # LLM repair's coarse threshold, and flipping to a throwaway fallback
+        # section would burn anti-repeat slots and reset phrase texture.
+        # Keep the last real palette; only the behavior falls back.
         kick_color, accent_color, _accent = self.variety.current_colors()
 
         renderer = self._behavior_map.get(behavior, self._render_beat_reactive)
