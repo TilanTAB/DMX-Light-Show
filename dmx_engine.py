@@ -147,6 +147,7 @@ def bloom_attack(current, target, speed=0.85):
 import bisect
 import zlib
 from dmx_variety import VarietyEngine
+from dmx_punch import velocity_brightness, afterglow
 
 
 class DmxEngineBase:
@@ -197,6 +198,9 @@ class DmxEngineBase:
         self.profile_snare_thresh = 0.35
         self.profile_onset_cooldown = ONSET_COOLDOWN
         self.profile_kick_dominance_ratio = 1.5
+        # Beat-hold shared by the punchy renderers (loopback overrides via profile)
+        self.profile_beat_hold = 4
+        self.beat_hold_frames = 0
         # Variety engine (anti-monotony policy; shared by both modes)
         self.variety = VarietyEngine()
         self._last_section_id = None
@@ -428,25 +432,30 @@ class DmxEngineBase:
     def _render_bass_white_blast(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                                  kick_color, accent_color, volume, cue, t):
         """WHITE LED blasts on every kick. Colored wash underneath from mids."""
-        # C1/C2 FIX: Apply AI-generated energy and dimmer
         energy = cue.get("energy", 7) if cue else 7
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
         energy_scale = 0.5 + (energy / 10.0)  # 0.6 to 1.5
-        velocity_master = (120.0 + 135.0 * self._beat_velocity) * dimmer
-
-        if is_kick:
-            self.out_w = 255.0 * dimmer
-            self.out_master = velocity_master
-        else:
-            self.out_w = ema(self.out_w, 0, 0, 0.35)
 
         wash_brightness = max(mid_i * 0.4 * energy_scale, 0.1)
         snare_boost = 0.6 * energy_scale if is_snare else 0.0
-
         self.out_r = ema(self.out_r, kick_color[0] * wash_brightness + accent_color[0] * snare_boost, 0.3, 0.08)
         self.out_g = ema(self.out_g, kick_color[1] * wash_brightness + accent_color[1] * snare_boost, 0.3, 0.08)
         self.out_b = ema(self.out_b, kick_color[2] * wash_brightness + accent_color[2] * snare_boost, 0.3, 0.08)
-        self.out_master = ema(self.out_master, max(120.0 * dimmer, volume * 4000), 0.5, 0.15)
+
+        if is_kick:
+            # Beat frame: velocity OWNS master. (Previously a trailing
+            # unconditional EMA overwrote this on the same frame -- the
+            # velocity-dilution bug found in review.)
+            self.out_w = 255.0 * dimmer
+            self.out_master = velocity_brightness(self._beat_velocity) * dimmer
+            self.beat_hold_frames = self.profile_beat_hold
+        elif self.beat_hold_frames > 0:
+            self.beat_hold_frames -= 1
+            self.out_w *= 0.80
+            self.out_master = max(self.out_master, 200.0 * dimmer)
+        else:
+            self.out_w = ema(self.out_w, 0, 0, 0.35)
+            self.out_master = ema(self.out_master, max(120.0 * dimmer, volume * 4000), 0.5, 0.15)
         self.out_strobe = 0
 
     def _render_color_chase(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
@@ -571,7 +580,17 @@ class DmxEngineBase:
         self.out_g = ema(self.out_g, tg, att, dec)
         self.out_b = ema(self.out_b, tb, att, dec)
         self.out_w = ema(self.out_w, tw, 0.9 if is_kick else 0.3, 0.25)
-        self.out_master = ema(self.out_master, tm, 0.8 if is_beat else 0.4, 0.12)
+
+        if is_beat:
+            self.out_master = velocity_brightness(self._beat_velocity) * dimmer
+            self.beat_hold_frames = self.profile_beat_hold
+        elif self.beat_hold_frames > 0:
+            self.beat_hold_frames -= 1
+            self.out_r, self.out_g, self.out_b, self.out_w = afterglow(
+                self.out_r, self.out_g, self.out_b, self.out_w)
+            self.out_master = max(self.out_master, 200.0 * dimmer)
+        else:
+            self.out_master = ema(self.out_master, tm, 0.4, 0.12)
 
         strobe = 0
         if cue and cue.get("strobe", False):

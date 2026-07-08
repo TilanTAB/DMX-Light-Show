@@ -46,7 +46,6 @@ class DMXEngine(DmxEngineBase):
         self.peak_kick = 0.0
         self.peak_snare = 0.0
         self.peak_mid = 0.0
-        self.beat_hold_frames = 0
         self.beat_hold_color = (255, 0, 50)
 
     def load_profile(self, profile_path):
