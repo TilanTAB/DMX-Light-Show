@@ -203,7 +203,12 @@ class DMXEngine(DmxEngineBase):
         # visual delay that made lights feel "late." Beat onset MUST be instant to
         # synchronize with the audio transient the ear just heard.
         if (is_kick or is_snare) and is_deep_bass:
-            self.out_r, self.out_g, self.out_b = accent
+            # Near-white accents (7/16 palettes, skewing high-energy) would
+            # collapse the "dual-color" blast into plain white on top of the
+            # white channel -- fall back to color_2 so combos stay visually
+            # distinct from normal kick beats.
+            combo = accent if sum(accent) < 700 else color_2
+            self.out_r, self.out_g, self.out_b = combo
             self.out_w = 255.0
             self.out_master = velocity_brightness
             self.out_strobe = 0
