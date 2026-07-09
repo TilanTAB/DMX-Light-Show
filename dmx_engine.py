@@ -77,6 +77,18 @@ ABYSSAL_DISCONTINUITY_THRESHOLD = 1.0  # seconds; a real audio-frame-to-frame
 # doesn't advance `t` at all, so no wall-clock delay can misfire this. If `t`
 # is ever changed to wall-clock, this threshold must be revisited.
 
+# golden_anthem renderer tuning. Accumulated-phase swell: phase only advances
+# by a clamped per-frame dt, so seeks/re-entry cannot corrupt it by design.
+ANTHEM_BASE_PERIOD = 12.0     # seconds per swell at zero music energy
+ANTHEM_MIN_PERIOD = 8.0       # loud passages swell faster, never below this
+ANTHEM_CREST_BASE = 0.55      # crest brightness at zero music energy
+ANTHEM_CREST_GAIN = 0.30      # how much sustained energy lifts the crest
+ANTHEM_CREST_MAX = 0.85       # hard cap
+ANTHEM_FLOOR_MIN = 0.10       # never-dark amber floor (not dimmer-scaled)
+ANTHEM_GOLD = (255, 190, 80)  # identity color; palette color_1 blends toward it
+ANTHEM_DT_CLAMP = 0.1         # max seconds of phase advance per frame
+ANTHEM_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => treat as one nominal frame
+
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
     ((255, 0, 50), (0, 150, 255)),     # Red vs Blue
@@ -95,6 +107,7 @@ VALID_BEHAVIORS = {
     "beat_reactive", "rainbow_sweep", "instant_flash",
     # Ambient/chill behaviors
     "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
+    "golden_anthem",
 }
 
 
@@ -130,6 +143,18 @@ GAMMA_LUT = np.array([int(((i / 255.0) ** 2.2) * 255) for i in range(256)], dtyp
 def gamma_correct(value):
     """Apply perceptual gamma curve so dimming feels linear to human eyes."""
     return int(GAMMA_LUT[max(0, min(255, int(value)))])
+
+
+def _anthem_envelope(phase):
+    """golden_anthem swell shape over one 0..1 cycle: smoothstep rise (40%),
+    crest hold (10%), smoothstep fall (50%)."""
+    if phase < 0.4:
+        p = phase / 0.4
+        return p * p * (3.0 - 2.0 * p)
+    if phase < 0.5:
+        return 1.0
+    p = 1.0 - (phase - 0.5) / 0.5
+    return p * p * (3.0 - 2.0 * p)
 
 
 # P0-3: bloom_attack is currently unused after the sync fix removed it from
@@ -220,6 +245,11 @@ class DmxEngineBase:
         self._ab_last_glint_t = 0.0        # same as _ab_last_bloom_t -- placeholder only
         self._ab_last_render_t = None      # last t this renderer was actually called with (None = never)
 
+        # golden_anthem renderer state
+        self._ga_phase = 0.0               # 0..1 position in the swell cycle
+        self._ga_energy = 0.0              # smoothed music energy (volume+mids EMA)
+        self._ga_last_render_t = None      # last t this renderer was called with
+
         # Playback / IPC state
         self.playback_position = 0.0
         self.playback_duration = 0.0
@@ -247,6 +277,7 @@ class DmxEngineBase:
             "sunset_fade": self._render_sunset_fade,
             "aurora_shimmer": self._render_aurora_shimmer,
             "abyssal_bloom": self._render_abyssal_bloom,
+            "golden_anthem": self._render_golden_anthem,
         }
 
     def _init_hardware(self):
@@ -857,6 +888,47 @@ class DmxEngineBase:
         self.out_b = ema(self.out_b, b, 0.05, 0.03)
         self.out_w = ema(self.out_w, w, 0.3, 0.15)
         self.out_master = ema(self.out_master, master, 0.05, 0.03)
+        self.out_strobe = 0
+
+    def _render_golden_anthem(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                              kick_color, accent_color, volume, cue, t):
+        """Majestic gold swells cresting into white-gold shimmer -- the
+        "hands in the air during the anthem" moment. Rides the music: a slow
+        volume/mids EMA lifts crest brightness (hard-capped) and quickens the
+        swell (period floor). No per-beat response, no strobe. Accumulated
+        phase: position advances only by a clamped per-frame dt, so seeks and
+        re-entry gaps cannot corrupt it (unlike absolute-t envelope math)."""
+        dimmer = (cue.get("dimmer", 60) if cue else 60) / 100.0
+
+        # dt from our own call cadence; a discontinuity (deselected, or a
+        # seek in either direction) counts as one nominal frame.
+        if (self._ga_last_render_t is None or
+                abs(t - self._ga_last_render_t) > ANTHEM_DISCONTINUITY_THRESHOLD):
+            dt = 0.012
+        else:
+            dt = min(max(t - self._ga_last_render_t, 0.0), ANTHEM_DT_CLAMP)
+        self._ga_last_render_t = t
+
+        # Slow smoothed music energy -- rides passages, ignores single hits.
+        self._ga_energy = ema(self._ga_energy,
+                              min(1.0, volume * 1000.0 + mid_i * 0.5), 0.1, 0.03)
+
+        period = ANTHEM_BASE_PERIOD - self._ga_energy * (ANTHEM_BASE_PERIOD - ANTHEM_MIN_PERIOD)
+        self._ga_phase = (self._ga_phase + dt / period) % 1.0
+
+        env = _anthem_envelope(self._ga_phase)
+        crest = min(ANTHEM_CREST_MAX, ANTHEM_CREST_BASE + self._ga_energy * ANTHEM_CREST_GAIN)
+        # Floor is NOT dimmer-scaled (PWM-visibility lesson from abyssal_bloom).
+        brightness = max(ANTHEM_FLOOR_MIN, env * crest * dimmer)
+
+        gold = lerp_color(kick_color, ANTHEM_GOLD, 0.6)  # variety-tinted gold
+        shimmer = max(0.0, env - 0.8) / 0.2              # white only near the crest
+
+        self.out_r = ema(self.out_r, gold[0] * brightness, 0.04, 0.03)
+        self.out_g = ema(self.out_g, gold[1] * brightness, 0.04, 0.03)
+        self.out_b = ema(self.out_b, gold[2] * brightness, 0.04, 0.03)
+        self.out_w = ema(self.out_w, 120.0 * shimmer * dimmer, 0.06, 0.05)
+        self.out_master = ema(self.out_master, 255.0 * brightness, 0.04, 0.03)
         self.out_strobe = 0
 
     def load_ai_show(self, show_file="current_show.json"):
