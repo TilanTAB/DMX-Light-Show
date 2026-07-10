@@ -144,7 +144,7 @@ class DMXEngine(DmxEngineBase):
             if beats_per_sec < 0.5 and recent_energy < overall_avg * 0.5:
                 # Very quiet — rotate through ambient behaviors for variety
                 ambient_pool = ["ocean_drift", "candlelight", "aurora_shimmer",
-                               "sunset_fade", "abyssal_bloom"]
+                               "sunset_fade", "abyssal_bloom", "golden_anthem"]
                 ambient_idx = int(current_time / 15.0) % len(ambient_pool)  # Switch every 15s
                 return ambient_pool[ambient_idx]
             elif beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7:
@@ -300,7 +300,7 @@ class DMXEngine(DmxEngineBase):
 
         # Ambient/chill behaviors → use the standard renderer dispatch
         ambient_behaviors = {"ocean_drift", "candlelight", "sunset_fade",
-                             "aurora_shimmer", "abyssal_bloom", "slow_breathe",
+                             "aurora_shimmer", "abyssal_bloom", "golden_anthem", "slow_breathe",
                              "static_wash", "buildup_ramp", "rainbow_sweep"}
 
         if auto_behavior in ambient_behaviors:

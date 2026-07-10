@@ -309,6 +309,10 @@ Use these for quiet sections, breakdowns, lo-fi, acoustic, and ambient music.
   USE FOR: Deep breakdowns, the quietest intros/outros, meditative or minimal-techno sections.
   FEEL: Vast, restrained, oceanic-depths. Darkness as the canvas.
 
+"golden_anthem" — Majestic slow gold swells that crest into white-gold shimmer, riding the music's sustained energy (louder passages crest brighter and swell faster, hard-capped). No beat flashing.
+  USE FOR: Finales, euphoric sing-along/anthem moments, emotional breakdowns, sunset sets.
+  FEEL: Majestic, golden, hands-in-the-air. The whole crowd swaying as one.
+
 === NARRATIVE ARC TEMPLATE ===
 A well-designed show follows this emotional curve:
   Intro: ocean_drift or aurora_shimmer (gentle, mysterious)
@@ -450,6 +454,7 @@ VALID_BEHAVIORS = {
     "beat_reactive", "bass_white_blast", "blackout_punch",
     # Ambient/chill behaviors
     "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
+    "golden_anthem",
 }
 
 
