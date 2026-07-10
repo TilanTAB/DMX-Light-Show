@@ -249,6 +249,7 @@ class DmxEngineBase:
         self._ga_phase = 0.0               # 0..1 position in the swell cycle
         self._ga_energy = 0.0              # smoothed music energy (volume+mids EMA)
         self._ga_last_render_t = None      # last t this renderer was called with
+        self._ga_loud_ref = 1e-6           # running loudness peak (self-normalizing, never zero)
 
         # Playback / IPC state
         self.playback_position = 0.0
@@ -910,8 +911,16 @@ class DmxEngineBase:
         self._ga_last_render_t = t
 
         # Slow smoothed music energy -- rides passages, ignores single hits.
+        # Self-normalizing: `volume` scales differ wildly between modes
+        # (loopback RMS ~0.002 vs synced normalized-WAV RMS ~0.05-0.3), so no
+        # absolute scale factor can work in both -- it saturates to a binary
+        # loud/silent switch. Instead track the song's own running loudness
+        # peak (fast attack, ~4%/s decay at ~86 fps) and measure energy
+        # relative to it: quiet verse < 1.0, drop/chorus ~= 1.0 in either mode.
+        raw = volume + mid_i * 0.02
+        self._ga_loud_ref = max(raw, self._ga_loud_ref * 0.9995)
         self._ga_energy = ema(self._ga_energy,
-                              min(1.0, volume * 1000.0 + mid_i * 0.5), 0.1, 0.03)
+                              min(1.0, raw / self._ga_loud_ref), 0.1, 0.03)
 
         period = ANTHEM_BASE_PERIOD - self._ga_energy * (ANTHEM_BASE_PERIOD - ANTHEM_MIN_PERIOD)
         self._ga_phase = (self._ga_phase + dt / period) % 1.0

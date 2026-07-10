@@ -38,6 +38,26 @@ def test_floor_keeps_light_alive_at_zero_dimmer():
     assert e.out_strobe == 0
 
 
+def test_energy_tracks_song_dynamics_not_binary():
+    # Regression: energy must be RELATIVE to the song's own loudness, not an
+    # absolute scale that saturates to 1.0 the moment any audio plays.
+    e = DmxEngineBase()
+    cue = {"dimmer": 60}
+    t = 0.0
+    for _ in range(300):                               # loud passage (chorus)
+        e._render_golden_anthem(0, 0, 0, 0.0, False, False,
+                                (255, 0, 120), (0, 220, 255), 0.1, cue, t)
+        t += 0.012
+    loud_energy = e._ga_energy
+    for _ in range(600):                               # sustained quiet verse
+        e._render_golden_anthem(0, 0, 0, 0.0, False, False,
+                                (255, 0, 120), (0, 220, 255), 0.02, cue, t)
+        t += 0.012
+    quiet_energy = e._ga_energy
+    assert loud_energy > 0.9
+    assert quiet_energy < 0.6                          # not pinned at max
+
+
 def test_registered_in_engine():
     e = DmxEngineBase()
     import dmx_engine
