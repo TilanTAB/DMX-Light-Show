@@ -8,7 +8,9 @@ from collections import deque
 import numpy as np
 import pyaudiowpatch as pyaudio
 from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
-                        LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH)
+                        LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
+                        DRY_RUN)
+from dmx_variety import Intent
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +46,7 @@ class DMXEngine(DmxEngineBase):
         self.peak_kick = 0.0
         self.peak_snare = 0.0
         self.peak_mid = 0.0
-        self.beat_hold_frames = 0
         self.beat_hold_color = (255, 0, 50)
-        self.prev_bps = 0.0
-        self.bps_check_time = 0.0
-        self.color_phase = 0
-        self.last_color_change = 0.0
 
     def load_profile(self, profile_path):
         """Load a lighting profile from a JSON file."""
@@ -147,7 +144,7 @@ class DMXEngine(DmxEngineBase):
             if beats_per_sec < 0.5 and recent_energy < overall_avg * 0.5:
                 # Very quiet — rotate through ambient behaviors for variety
                 ambient_pool = ["ocean_drift", "candlelight", "aurora_shimmer",
-                               "sunset_fade", "abyssal_bloom"]
+                               "sunset_fade", "abyssal_bloom", "golden_anthem"]
                 ambient_idx = int(current_time / 15.0) % len(ambient_pool)  # Switch every 15s
                 return ambient_pool[ambient_idx]
             elif beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7:
@@ -175,11 +172,11 @@ class DMXEngine(DmxEngineBase):
     def _render_loopback_direct(self, kick_mag, snare_mag, mid_mag, hihat_mag,
                                 kick_i, snare_i, hihat_i, mid_i,
                                 is_kick, is_snare,
-                                color_1, color_2, volume, t, color_idx=0):
+                                color_1, color_2, accent, volume, t):
         """
-        Loopback renderer with rhythm-aware color cycling and deep bass combos.
-        - Colors cycle on rhythm changes (tempo shifts, breaks, fills)
-        - Deep bass hits trigger dual-color combos (purple, cyan, yellow)
+        Loopback renderer with palette-driven colors and deep bass combos.
+        - Colors come from the VarietyEngine's current palette (kick/accent/combo)
+        - Deep bass hits trigger a dual-color combo blast (accent + white)
         """
         self.peak_kick = max(kick_mag, self.peak_kick * 0.97)
         self.peak_mid = max(mid_mag, self.peak_mid * 0.97)
@@ -205,15 +202,12 @@ class DMXEngine(DmxEngineBase):
         # visual delay that made lights feel "late." Beat onset MUST be instant to
         # synchronize with the audio transient the ear just heard.
         if (is_kick or is_snare) and is_deep_bass:
-            combo = color_idx % 4
-            if combo == 0:
-                self.out_r, self.out_g, self.out_b = 255.0, 0, 200.0
-            elif combo == 1:
-                self.out_r, self.out_g, self.out_b = 255.0, 200.0, 0
-            elif combo == 2:
-                self.out_r, self.out_g, self.out_b = 0, 200.0, 255.0
-            else:
-                self.out_r, self.out_g, self.out_b = 200.0, 200.0, 200.0
+            # Near-white accents (7/16 palettes, skewing high-energy) would
+            # collapse the "dual-color" blast into plain white on top of the
+            # white channel -- fall back to color_2 so combos stay visually
+            # distinct from normal kick beats.
+            combo = accent if sum(accent) < 700 else color_2
+            self.out_r, self.out_g, self.out_b = combo
             self.out_w = 255.0
             self.out_master = velocity_brightness
             self.out_strobe = 0
@@ -222,10 +216,9 @@ class DMXEngine(DmxEngineBase):
 
         # ── NORMAL BEAT: Instant color snap ──
         if is_kick or is_snare:
-            self.out_r = 255.0 if color_idx == 0 else 0
-            self.out_g = 255.0 if color_idx == 2 else 0
-            self.out_b = 255.0 if color_idx == 1 else 0
-            self.out_w = 255.0 if color_idx == 3 else 0
+            col = color_1 if is_kick else color_2
+            self.out_r, self.out_g, self.out_b = col
+            self.out_w = 255.0 if is_kick else 0.0
             self.out_master = velocity_brightness
             self.out_strobe = 0
             self.beat_hold_frames = self.profile_beat_hold
@@ -251,10 +244,10 @@ class DMXEngine(DmxEngineBase):
 
         if bass_active:
             glow = (bass - self.profile_glow_thresh) * 0.4
-            self.out_r = 255.0 * glow if color_idx == 0 else 0
-            self.out_g = 255.0 * glow if color_idx == 2 else 0
-            self.out_b = 255.0 * glow if color_idx == 1 else 0
-            self.out_w = 255.0 * glow if color_idx == 3 else 0
+            self.out_r = color_1[0] * glow
+            self.out_g = color_1[1] * glow
+            self.out_b = color_1[2] * glow
+            self.out_w = 0.0
             self.out_master = max(15, glow * 180)
         else:
             # S3: Warm afterglow tail
@@ -277,37 +270,23 @@ class DMXEngine(DmxEngineBase):
                   is_kick, is_snare, volume, sr, elapsed_seconds=None):
         current_time = time.time()
         beats_per_sec = self.beats_per_sec
-        # --- Loopback dispatch ---
         t = self.frame_counter * BLOCK_SIZE / sr
 
-        # ── Color cycling based on profile mode ──
-        cycle_mode = self.profile_color_cycle_mode
+        # ── Variety layer: energy state acts as the "section"; a stable state
+        # still evolves after _evolution_secs so loopback never goes static. ──
+        bpm = beats_per_sec * 60.0
+        mood = {"calm": "warm", "building": "cool",
+                "high": "neon", "dropping": "euphoric"}.get(self.energy_state, "cool")
+        energy = {"calm": 2, "building": 5, "high": 8, "dropping": 6}.get(self.energy_state, 5)
 
-        if cycle_mode == "rhythm":
-            if current_time - self.bps_check_time > 2.0:
-                bps_change = abs(beats_per_sec - self.prev_bps)
-                bps_threshold = max(0.5, self.prev_bps * self.profile_rhythm_change_pct)
-
-                if bps_change > bps_threshold and self.prev_bps > 0:
-                    self.color_phase = (self.color_phase + 1) % 4
-                    self.last_color_change = current_time
-                    logger.info(f"[RHYTHM] BPS {self.prev_bps:.1f} -> {beats_per_sec:.1f} | Color -> {['R','B','G','W'][self.color_phase]}")
-
-                self.prev_bps = beats_per_sec
-                self.bps_check_time = current_time
-
-            if current_time - self.last_color_change > self.profile_color_cycle_interval:
-                self.color_phase = (self.color_phase + 1) % 4
-                self.last_color_change = current_time
-
-        elif cycle_mode == "time":
-            self.color_phase = int(t / self.profile_color_cycle_interval) % 4
-
-        elif cycle_mode == "beat":
-            self.color_phase = (self.total_beat_count // 4) % 4
-
-        color_phase = self.color_phase
-        kick_color, accent_color = self.palettes[self.current_palette_idx % len(self.palettes)]
+        ev = self.variety.tick(is_beat=(is_kick or is_snare), bpm=bpm, t=t)
+        force_evolve = ev["seconds_in_section"] >= self._evolution_secs
+        if self.energy_state != self._last_section_id or force_evolve:
+            self._last_section_id = self.energy_state
+            self.variety.begin_section(Intent(
+                energy=energy, mood=mood, section_id=self.energy_state,
+                is_new_section=True, bpm=bpm, strobe_allowed=True))
+        kick_color, accent_color, combo_color = self.variety.current_colors()
 
         # ── Auto-behavior detection: picks chill or punchy ──
         auto_behavior = self._detect_auto_behavior(volume, kick_i, snare_i, current_time, beats_per_sec)
@@ -320,9 +299,8 @@ class DMXEngine(DmxEngineBase):
             self._write_playback_state()
 
         # Ambient/chill behaviors → use the standard renderer dispatch
-        # (these renderers take the same args as synced-mode renderers)
         ambient_behaviors = {"ocean_drift", "candlelight", "sunset_fade",
-                             "aurora_shimmer", "abyssal_bloom", "slow_breathe",
+                             "aurora_shimmer", "abyssal_bloom", "golden_anthem", "slow_breathe",
                              "static_wash", "buildup_ramp", "rainbow_sweep"}
 
         if auto_behavior in ambient_behaviors:
@@ -332,15 +310,23 @@ class DMXEngine(DmxEngineBase):
             renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                      kick_color, accent_color, volume, cue, t)
         else:
-            # Punchy behaviors → loopback direct renderer (full R→B→G→W system)
+            # Punchy behaviors → loopback direct renderer (palette-driven)
             self._render_loopback_direct(
                 kick_mag, snare_mag, mid_mag, hihat_mag,
                 kick_i, snare_i, hihat_i, mid_i,
                 is_kick, is_snare,
-                kick_color, accent_color, volume, t, color_phase
-            )
+                kick_color, accent_color, combo_color, volume, t)
 
     def run_loopback_mode(self, show_file=None):
+        if DRY_RUN:
+            # The DRY_RUN offline harness is synced-only. Loopback under this
+            # flag would still open a live WASAPI stream but silently discard
+            # every DMX frame with no diagnostic output -- warn loudly so a
+            # leftover env var (inherited through app.py's subprocess spawn)
+            # can't masquerade as "lights mysteriously dead".
+            logger.warning("[DRY-RUN] DMX_DRY_RUN=1 is set: loopback will run "
+                           "WITHOUT hardware output (frames discarded). This "
+                           "harness is intended for synced-mode verification only.")
         self._init_hardware()
         if show_file:
             self.load_ai_show(show_file)

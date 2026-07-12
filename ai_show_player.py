@@ -4,7 +4,8 @@ import sys
 import time
 import logging
 import pyaudiowpatch as pyaudio
-from dmx_engine import DmxEngineBase, BLOCK_SIZE
+from dmx_engine import DmxEngineBase, BLOCK_SIZE, DRY_RUN
+from dmx_variety import Intent
 
 logger = logging.getLogger(__name__)
 
@@ -17,21 +18,36 @@ class DMXEngine(DmxEngineBase):
                   kick_i, snare_i, hihat_i, mid_i,
                   is_kick, is_snare, volume, sr, elapsed_seconds=None):
         t = elapsed_seconds
-        # Palette rotation every 16 beats (was inline in the old process_audio)
-        if (is_kick or is_snare) and self.total_beat_count % 16 == 0:
-            self.current_palette_idx = (self.current_palette_idx + 1) % len(self.palettes)
 
-        if self.synced_cues:
-            cue = self._get_active_cue(elapsed_seconds)
-            if cue:
-                kick_color = cue["color_1"]; accent_color = cue["color_2"]
-                behavior = cue.get("behavior", "beat_reactive")
-            else:
-                kick_color, accent_color = self.palettes[self.current_palette_idx]
-                behavior = "beat_reactive"; cue = None
-        else:
-            kick_color, accent_color = self.palettes[self.current_palette_idx]
-            behavior = "beat_reactive"; cue = None
+        cue = self._get_active_cue(elapsed_seconds) if self.synced_cues else None
+        behavior = cue.get("behavior", "beat_reactive") if cue else "beat_reactive"
+
+        # Variety layer: LLM cue supplies intent (energy/mood/color seed); the
+        # engine owns final color, anti-repeat, and phrase-grid texture.
+        self.variety.tick(is_beat=(is_kick or is_snare), bpm=self.show_bpm, t=t)
+        if cue:
+            # Composite key: keying on the name alone would suppress the
+            # palette change between two ADJACENT same-named cues (nothing in
+            # the LLM prompt or repair forbids them).
+            section_id = f'{cue.get("start", 0)}:{cue.get("name", "")}'
+            if section_id != self._last_section_id:
+                self._last_section_id = section_id
+                try:
+                    energy = int(cue.get("energy", 5))
+                except (TypeError, ValueError):
+                    # Library shows replay without re-running the LLM repair;
+                    # a hand-edited/legacy file must not kill playback.
+                    energy = 5
+                self.variety.begin_section(Intent(
+                    energy=energy, mood=cue.get("mood"), section_id=section_id,
+                    is_new_section=True, bpm=self.show_bpm,
+                    strobe_allowed=bool(cue.get("strobe", False)),
+                    seed_color=list(cue.get("color_1", (255, 255, 255)))))
+        # No begin_section during between-cue gaps: sub-0.5s gaps survive the
+        # LLM repair's coarse threshold, and flipping to a throwaway fallback
+        # section would burn anti-repeat slots and reset phrase texture.
+        # Keep the last real palette; only the behavior falls back.
+        kick_color, accent_color, _accent = self.variety.current_colors()
 
         renderer = self._behavior_map.get(behavior, self._render_beat_reactive)
         renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
@@ -50,6 +66,36 @@ class DMXEngine(DmxEngineBase):
         if self.synced_cues:
             behaviors = set(c["behavior"] for c in self.synced_cues)
             logger.info(f"[SYNCED] {len(self.synced_cues)} cues, behaviors: {behaviors}")
+
+        # NOTE: the no-sleep loop below compresses hours of audio-time into
+        # seconds of wall-clock. Beat-onset cooldown is wall-clock based
+        # (time.time() in process_audio), so beat cadence in DRY_RUN logs is
+        # NOT representative of real playback -- use this harness to verify
+        # cue/palette/frame wiring, never beat timing or beat-driven velocity.
+        if DRY_RUN:
+            wf = wave_mod.open(audio_path, 'rb')
+            try:
+                sample_rate = wf.getframerate()
+                frames_played = 0
+                last_cue = None
+                data = wf.readframes(BLOCK_SIZE)
+                while data:
+                    elapsed = frames_played / sample_rate
+                    self.process_audio(data, elapsed_seconds=elapsed,
+                                       input_format="int16", actual_sample_rate=sample_rate)
+                    cue = self._get_active_cue(elapsed)
+                    name = cue["name"] if cue else None
+                    if name != last_cue:
+                        last_cue = name
+                        logger.info(f"[DRY {elapsed:6.1f}s] cue={name} "
+                                    f"palette={self.variety.current_palette['id']} "
+                                    f"frame={self.last_frame}")
+                    frames_played += BLOCK_SIZE
+                    data = wf.readframes(BLOCK_SIZE)
+            finally:
+                wf.close()
+            logger.info("[DRY-RUN] Completed synced pass.")
+            return
 
         wf = wave_mod.open(audio_path, 'rb')
         p = pyaudio.PyAudio()

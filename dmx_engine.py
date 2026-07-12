@@ -17,6 +17,10 @@ import queue
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Offline verification: DMX_DRY_RUN=1 skips USB init and records frames on
+# self.last_frame instead of transferring. Used by the dry-run playback branch.
+DRY_RUN = os.getenv("DMX_DRY_RUN") == "1"
+
 # ==========================================
 # CONSTANTS (immutable — safe at module level)
 # ==========================================
@@ -73,6 +77,18 @@ ABYSSAL_DISCONTINUITY_THRESHOLD = 1.0  # seconds; a real audio-frame-to-frame
 # doesn't advance `t` at all, so no wall-clock delay can misfire this. If `t`
 # is ever changed to wall-clock, this threshold must be revisited.
 
+# golden_anthem renderer tuning. Accumulated-phase swell: phase only advances
+# by a clamped per-frame dt, so seeks/re-entry cannot corrupt it by design.
+ANTHEM_BASE_PERIOD = 12.0     # seconds per swell at zero music energy
+ANTHEM_MIN_PERIOD = 8.0       # loud passages swell faster, never below this
+ANTHEM_CREST_BASE = 0.55      # crest brightness at zero music energy
+ANTHEM_CREST_GAIN = 0.30      # how much sustained energy lifts the crest
+ANTHEM_CREST_MAX = 0.85       # hard cap
+ANTHEM_FLOOR_MIN = 0.10       # never-dark amber floor (not dimmer-scaled)
+ANTHEM_GOLD = (255, 190, 80)  # identity color; palette color_1 blends toward it
+ANTHEM_DT_CLAMP = 0.1         # max seconds of phase advance per frame
+ANTHEM_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => treat as one nominal frame
+
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
     ((255, 0, 50), (0, 150, 255)),     # Red vs Blue
@@ -91,6 +107,7 @@ VALID_BEHAVIORS = {
     "beat_reactive", "rainbow_sweep", "instant_flash",
     # Ambient/chill behaviors
     "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
+    "golden_anthem",
 }
 
 
@@ -128,6 +145,18 @@ def gamma_correct(value):
     return int(GAMMA_LUT[max(0, min(255, int(value)))])
 
 
+def _anthem_envelope(phase):
+    """golden_anthem swell shape over one 0..1 cycle: smoothstep rise (40%),
+    crest hold (10%), smoothstep fall (50%)."""
+    if phase < 0.4:
+        p = phase / 0.4
+        return p * p * (3.0 - 2.0 * p)
+    if phase < 0.5:
+        return 1.0
+    p = 1.0 - (phase - 0.5) / 0.5
+    return p * p * (3.0 - 2.0 * p)
+
+
 # P0-3: bloom_attack is currently unused after the sync fix removed it from
 # beat onset paths. Kept as a utility for future smooth-transition effects
 # (e.g., slow color crossfades, ambient glow ramps).
@@ -141,7 +170,9 @@ def bloom_attack(current, target, speed=0.85):
 # ============================================================
 
 import bisect
+import zlib
 from dmx_variety import VarietyEngine
+from dmx_punch import velocity_brightness, afterglow
 
 
 class DmxEngineBase:
@@ -176,6 +207,7 @@ class DmxEngineBase:
         self._cue_starts = []
         self.show_bpm = 0.0
         self.audio_file = None
+        self.last_frame = None             # populated only in DRY_RUN mode
         # FFT caches
         self._hanning_cache = {}
         self._fft_freq_cache = {}
@@ -191,6 +223,9 @@ class DmxEngineBase:
         self.profile_snare_thresh = 0.35
         self.profile_onset_cooldown = ONSET_COOLDOWN
         self.profile_kick_dominance_ratio = 1.5
+        # Beat-hold shared by the punchy renderers (loopback overrides via profile)
+        self.profile_beat_hold = 4
+        self.beat_hold_frames = 0
         # Variety engine (anti-monotony policy; shared by both modes)
         self.variety = VarietyEngine()
         self._last_section_id = None
@@ -209,6 +244,12 @@ class DmxEngineBase:
         self._ab_glint_t0 = 0.0
         self._ab_last_glint_t = 0.0        # same as _ab_last_bloom_t -- placeholder only
         self._ab_last_render_t = None      # last t this renderer was actually called with (None = never)
+
+        # golden_anthem renderer state
+        self._ga_phase = 0.0               # 0..1 position in the swell cycle
+        self._ga_energy = 0.0              # smoothed music energy (volume+mids EMA)
+        self._ga_last_render_t = None      # last t this renderer was called with
+        self._ga_loud_ref = 1e-6           # running loudness peak (self-normalizing, never zero)
 
         # Playback / IPC state
         self.playback_position = 0.0
@@ -237,10 +278,15 @@ class DmxEngineBase:
             "sunset_fade": self._render_sunset_fade,
             "aurora_shimmer": self._render_aurora_shimmer,
             "abyssal_bloom": self._render_abyssal_bloom,
+            "golden_anthem": self._render_golden_anthem,
         }
 
     def _init_hardware(self):
         """Find uDMX adapter. Raises RuntimeError if not found."""
+        if DRY_RUN:
+            logger.info("[DRY-RUN] Skipping uDMX init; frames recorded, not sent.")
+            self.dev = None
+            return
         self.dev = usb.core.find(idVendor=0x16C0, idProduct=0x05DC)
         if self.dev is None:
             raise RuntimeError("uDMX not found! Please connect the adapter.")
@@ -272,6 +318,9 @@ class DmxEngineBase:
                 logger.error(f"[DMX WORKER] Error: {ex}")
 
     def send_dmx(self, master, red, green, blue, white=0, strobe=0):
+        if DRY_RUN:
+            self.last_frame = (int(master), int(red), int(green), int(blue), int(white), int(strobe))
+            return
         # S2: Apply gamma correction to color channels for perceptually linear fading.
         # Master/strobe stay linear (they're intensity controls, not color output).
         data = [
@@ -415,25 +464,30 @@ class DmxEngineBase:
     def _render_bass_white_blast(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
                                  kick_color, accent_color, volume, cue, t):
         """WHITE LED blasts on every kick. Colored wash underneath from mids."""
-        # C1/C2 FIX: Apply AI-generated energy and dimmer
         energy = cue.get("energy", 7) if cue else 7
         dimmer = (cue.get("dimmer", 80) if cue else 80) / 100.0
         energy_scale = 0.5 + (energy / 10.0)  # 0.6 to 1.5
-        velocity_master = (120.0 + 135.0 * self._beat_velocity) * dimmer
-
-        if is_kick:
-            self.out_w = 255.0 * dimmer
-            self.out_master = velocity_master
-        else:
-            self.out_w = ema(self.out_w, 0, 0, 0.35)
 
         wash_brightness = max(mid_i * 0.4 * energy_scale, 0.1)
         snare_boost = 0.6 * energy_scale if is_snare else 0.0
-
         self.out_r = ema(self.out_r, kick_color[0] * wash_brightness + accent_color[0] * snare_boost, 0.3, 0.08)
         self.out_g = ema(self.out_g, kick_color[1] * wash_brightness + accent_color[1] * snare_boost, 0.3, 0.08)
         self.out_b = ema(self.out_b, kick_color[2] * wash_brightness + accent_color[2] * snare_boost, 0.3, 0.08)
-        self.out_master = ema(self.out_master, max(120.0 * dimmer, volume * 4000), 0.5, 0.15)
+
+        if is_kick:
+            # Beat frame: velocity OWNS master. (Previously a trailing
+            # unconditional EMA overwrote this on the same frame -- the
+            # velocity-dilution bug found in review.)
+            self.out_w = 255.0 * dimmer
+            self.out_master = velocity_brightness(self._beat_velocity) * dimmer
+            self.beat_hold_frames = self.profile_beat_hold
+        elif self.beat_hold_frames > 0:
+            self.beat_hold_frames -= 1
+            self.out_w *= 0.80
+            self.out_master = max(self.out_master, 200.0 * dimmer)
+        else:
+            self.out_w = ema(self.out_w, 0, 0, 0.35)
+            self.out_master = ema(self.out_master, max(120.0 * dimmer, volume * 4000), 0.5, 0.15)
         self.out_strobe = 0
 
     def _render_color_chase(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
@@ -558,7 +612,17 @@ class DmxEngineBase:
         self.out_g = ema(self.out_g, tg, att, dec)
         self.out_b = ema(self.out_b, tb, att, dec)
         self.out_w = ema(self.out_w, tw, 0.9 if is_kick else 0.3, 0.25)
-        self.out_master = ema(self.out_master, tm, 0.8 if is_beat else 0.4, 0.12)
+
+        if is_beat:
+            self.out_master = velocity_brightness(self._beat_velocity) * dimmer
+            self.beat_hold_frames = self.profile_beat_hold
+        elif self.beat_hold_frames > 0:
+            self.beat_hold_frames -= 1
+            self.out_r, self.out_g, self.out_b, self.out_w = afterglow(
+                self.out_r, self.out_g, self.out_b, self.out_w)
+            self.out_master = max(self.out_master, 200.0 * dimmer)
+        else:
+            self.out_master = ema(self.out_master, tm, 0.4, 0.12)
 
         strobe = 0
         if cue and cue.get("strobe", False):
@@ -827,6 +891,55 @@ class DmxEngineBase:
         self.out_master = ema(self.out_master, master, 0.05, 0.03)
         self.out_strobe = 0
 
+    def _render_golden_anthem(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                              kick_color, accent_color, volume, cue, t):
+        """Majestic gold swells cresting into white-gold shimmer -- the
+        "hands in the air during the anthem" moment. Rides the music: a slow
+        volume/mids EMA lifts crest brightness (hard-capped) and quickens the
+        swell (period floor). No per-beat response, no strobe. Accumulated
+        phase: position advances only by a clamped per-frame dt, so seeks and
+        re-entry gaps cannot corrupt it (unlike absolute-t envelope math)."""
+        dimmer = (cue.get("dimmer", 60) if cue else 60) / 100.0
+
+        # dt from our own call cadence; a discontinuity (deselected, or a
+        # seek in either direction) counts as one nominal frame.
+        if (self._ga_last_render_t is None or
+                abs(t - self._ga_last_render_t) > ANTHEM_DISCONTINUITY_THRESHOLD):
+            dt = 0.012
+        else:
+            dt = min(max(t - self._ga_last_render_t, 0.0), ANTHEM_DT_CLAMP)
+        self._ga_last_render_t = t
+
+        # Slow smoothed music energy -- rides passages, ignores single hits.
+        # Self-normalizing: `volume` scales differ wildly between modes
+        # (loopback RMS ~0.002 vs synced normalized-WAV RMS ~0.05-0.3), so no
+        # absolute scale factor can work in both -- it saturates to a binary
+        # loud/silent switch. Instead track the song's own running loudness
+        # peak (fast attack, ~4%/s decay at ~86 fps) and measure energy
+        # relative to it: quiet verse < 1.0, drop/chorus ~= 1.0 in either mode.
+        raw = volume + mid_i * 0.02
+        self._ga_loud_ref = max(raw, self._ga_loud_ref * 0.9995)
+        self._ga_energy = ema(self._ga_energy,
+                              min(1.0, raw / self._ga_loud_ref), 0.1, 0.03)
+
+        period = ANTHEM_BASE_PERIOD - self._ga_energy * (ANTHEM_BASE_PERIOD - ANTHEM_MIN_PERIOD)
+        self._ga_phase = (self._ga_phase + dt / period) % 1.0
+
+        env = _anthem_envelope(self._ga_phase)
+        crest = min(ANTHEM_CREST_MAX, ANTHEM_CREST_BASE + self._ga_energy * ANTHEM_CREST_GAIN)
+        # Floor is NOT dimmer-scaled (PWM-visibility lesson from abyssal_bloom).
+        brightness = max(ANTHEM_FLOOR_MIN, env * crest * dimmer)
+
+        gold = lerp_color(kick_color, ANTHEM_GOLD, 0.6)  # variety-tinted gold
+        shimmer = max(0.0, env - 0.8) / 0.2              # white only near the crest
+
+        self.out_r = ema(self.out_r, gold[0] * brightness, 0.04, 0.03)
+        self.out_g = ema(self.out_g, gold[1] * brightness, 0.04, 0.03)
+        self.out_b = ema(self.out_b, gold[2] * brightness, 0.04, 0.03)
+        self.out_w = ema(self.out_w, 120.0 * shimmer * dimmer, 0.06, 0.05)
+        self.out_master = ema(self.out_master, 255.0 * brightness, 0.04, 0.03)
+        self.out_strobe = 0
+
     def load_ai_show(self, show_file="current_show.json"):
         """Load AI-generated palettes and cue list from a show JSON file."""
         if not os.path.exists(show_file):
@@ -838,6 +951,31 @@ class DmxEngineBase:
                 data = json.load(f)
 
             plan = data.get("lighting_plan", {})
+
+            # Per-song identity. NOT builtin hash(): Python salts string hashes
+            # per process, and every playback is a fresh worker process, so
+            # hash() would silently break same-song-same-look replay
+            # determinism. zlib.crc32 is stdlib and process-stable.
+            # Guarded independently: malformed metadata must degrade (bpm 0.0 =
+            # time-based phrasing), never abort loading the cues/palettes below.
+            metrics = data.get("song_metrics", {})
+            if not isinstance(metrics, dict):
+                logger.warning(f"Malformed song_metrics ({type(metrics).__name__}); ignoring")
+                metrics = {}
+            try:
+                self.show_bpm = float(metrics.get("bpm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                logger.warning(f"Malformed song_metrics.bpm ({metrics.get('bpm')!r}); "
+                               "falling back to 0.0 (time-based phrasing)")
+                self.show_bpm = 0.0
+            name = plan.get("show_name")
+            audio = data.get("audio_file")
+            # basename, not abspath: seed must not change when the install
+            # moves drives/folders (app.py's slug convention does the same).
+            seed_basis = (name if isinstance(name, str) and name
+                          else os.path.basename(audio) if isinstance(audio, str) and audio
+                          else "")
+            self.variety.set_song_seed(zlib.crc32(seed_basis.encode("utf-8")))
 
             phrases = plan.get("phrases", [])
             if phrases:
