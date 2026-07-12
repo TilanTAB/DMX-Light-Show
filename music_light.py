@@ -212,7 +212,9 @@ class DMXEngine(DmxEngineBase):
             combo = accent if sum(accent) < 700 else color_2
             self.out_r, self.out_g, self.out_b = combo
             self.out_w = 255.0
-            self.out_master = velocity_brightness
+            # Deep-bass combos are the dramatic "special blast" -- keep a 200
+            # master floor so graded velocity can't dim them, grade above it.
+            self.out_master = max(200.0, velocity_brightness)
             self.out_strobe = 0
             self.beat_hold_frames = self.profile_deep_bass_hold
             return

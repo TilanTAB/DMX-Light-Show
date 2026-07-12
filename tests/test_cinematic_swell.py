@@ -1,6 +1,7 @@
 """cinematic_swell: calm drifting floor + eased swells on strong kicks only.
-Pins: ratio-based trigger gate (kick_i vs onset threshold -- _beat_velocity
-clamps to 1.0 on every onset frame, so it cannot gate anything), peak cap,
+Pins: ratio-based trigger gate (kick_i vs onset threshold -- deliberately
+independent of _beat_velocity, which GRADES every onset from ratio 1.0 via
+beat_velocity_from_ratio while this gate IGNORES hits below 1.6x), peak cap,
 smooth rise (no instant flash), decay back to floor, ratio-scaled peaks,
 sag-free mid-rise retrigger, discontinuity guard, registration."""
 import os
@@ -23,8 +24,8 @@ def make_engine():
 
 def run_frames(eng, n, t0=0.0, kick_i=0.0, kick_first=False, dt=0.012):
     """Drive the renderer directly for n frames; returns final t.
-    On the kick frame, _beat_velocity = 1.0 mirrors reality: process_audio
-    computes min(1.0, kick_i/thresh), which clamps to 1.0 whenever is_kick."""
+    _beat_velocity is set but irrelevant here: the renderer gates on the raw
+    kick_i/thresh ratio (CINE_TRIGGER_RATIO), not on graded velocity."""
     t = t0
     for i in range(n):
         hit = kick_first and i == 0

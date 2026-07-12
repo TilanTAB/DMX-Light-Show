@@ -93,10 +93,11 @@ ANTHEM_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => treat as one nominal 
 # and a slow eased swell (rise + fall, ~2s total) fired only by STRONG kicks.
 # Accumulated-dt like golden_anthem: swell/drift progress advances by clamped
 # per-frame dt, so seeks and ambient-rotation re-entry cannot corrupt it.
-# Gate on the RAW kick ratio, not _beat_velocity: process_audio computes
-# velocity = min(1.0, kick_i / kick_thresh), and is_kick already requires
-# kick_i > kick_thresh -- so velocity clamps to exactly 1.0 on every onset
-# frame by construction and can never distinguish weak from strong hits.
+# Gate on the RAW kick ratio, not _beat_velocity: they do different jobs.
+# _beat_velocity GRADES every onset from ratio 1.0 up (beat_velocity_from_ratio,
+# dmx_punch.py); this renderer GATES at CINE_TRIGGER_RATIO so weak onsets are
+# ignored entirely and the floor stays calm. CINE_FULL_RATIO matches
+# PUNCH_FULL_RATIO (3.0) deliberately so "full blast" means the same hit.
 CINE_TRIGGER_RATIO = 1.6      # kick_i must exceed 1.6x onset threshold to swell
 CINE_FULL_RATIO = 3.0         # ratio at which the swell peaks at max
 CINE_RISE_S = 0.5             # eased rise duration (seconds)
@@ -1018,9 +1019,9 @@ class DmxEngineBase:
         self._cs_last_render_t = t
 
         # --- Trigger: strong kicks only, gated on the RAW kick ratio.
-        # _beat_velocity is useless here: it clamps to 1.0 on every onset
-        # frame (is_kick requires kick_i > thresh, velocity = min(1, kick_i/
-        # thresh)), so weak and strong hits are indistinguishable through it.
+        # Deliberately independent of _beat_velocity: velocity GRADES every
+        # onset from ratio 1.0; this gate IGNORES onsets below
+        # CINE_TRIGGER_RATIO (1.6x) so the calm floor survives weak hits.
         ratio = kick_i / max(self.profile_kick_thresh, 0.01)
         if is_kick and ratio >= CINE_TRIGGER_RATIO:
             strength = min(1.0, (ratio - CINE_TRIGGER_RATIO) /

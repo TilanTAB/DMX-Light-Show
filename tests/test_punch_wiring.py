@@ -88,6 +88,22 @@ def test_loopback_direct_master_graded_by_kick_strength():
     assert hard == 255.0       # 3x threshold -> full blast
     assert soft < hard
 
+def test_loopback_deep_bass_blast_stays_bright_on_soft_kick():
+    # The deep-bass combo is a deliberately dramatic special blast (white 255).
+    # Graded velocity must not dim it into mush: master keeps a 200 floor,
+    # grading only above that.
+    from music_light import DMXEngine
+    e = DMXEngine()
+    e.profile_deep_bass_enabled = True
+    # kick_mag == fresh peak_kick -> ratio 1.0 > deep_bass_thresh (0.80)
+    kick_i = e.profile_kick_thresh * 1.05   # barely-over-threshold kick
+    e._render_loopback_direct(0.5, 0, 0, 0, kick_i, 0.0, 0, 0,
+                              True, False,
+                              (255, 0, 120), (0, 220, 255), (255, 255, 0),
+                              0.05, 1.0)
+    assert e.out_w == 255.0            # confirms the deep-bass branch fired
+    assert e.out_master >= 200.0
+
 def test_loopback_direct_uses_shared_velocity_helper():
     import inspect, music_light
     src = inspect.getsource(music_light.DMXEngine._render_loopback_direct)
