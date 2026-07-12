@@ -89,6 +89,20 @@ ANTHEM_GOLD = (255, 190, 80)  # identity color; palette color_1 blends toward it
 ANTHEM_DT_CLAMP = 0.1         # max seconds of phase advance per frame
 ANTHEM_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => treat as one nominal frame
 
+# cinematic_swell renderer tuning. Film-score hits: a calm drifting floor,
+# and a slow eased swell (rise + fall, ~2s total) fired only by STRONG kicks.
+# Accumulated-dt like golden_anthem: swell/drift progress advances by clamped
+# per-frame dt, so seeks and ambient-rotation re-entry cannot corrupt it.
+CINE_TRIGGER_VELOCITY = 0.55  # min _beat_velocity to start a swell
+CINE_RISE_S = 0.5             # eased rise duration (seconds)
+CINE_FALL_S = 1.4             # eased fall duration (seconds)
+CINE_FLOOR_MIN = 0.08         # never-dark floor (not dimmer-scaled; abyssal PWM lesson)
+CINE_PEAK_MAX = 0.90          # hard cap on swell peak brightness fraction
+CINE_DRIFT_PERIOD_S = 20.0    # idle floor drifts color_1 <-> color_2 this slowly
+CINE_WHITE_PEAK = 100.0       # max white-channel lift at swell peak
+CINE_DT_CLAMP = 0.1           # max seconds of progress per frame
+CINE_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => one nominal frame
+
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
     ((255, 0, 50), (0, 150, 255)),     # Red vs Blue
@@ -107,7 +121,7 @@ VALID_BEHAVIORS = {
     "beat_reactive", "rainbow_sweep", "instant_flash",
     # Ambient/chill behaviors
     "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
-    "golden_anthem",
+    "golden_anthem", "cinematic_swell",
 }
 
 
@@ -155,6 +169,22 @@ def _anthem_envelope(phase):
         return 1.0
     p = 1.0 - (phase - 0.5) / 0.5
     return p * p * (3.0 - 2.0 * p)
+
+
+def _cine_envelope(age):
+    """Eased swell envelope: smoothstep up over CINE_RISE_S, smoothstep down
+    over CINE_FALL_S. `age` is seconds since trigger; returns 0..1.
+    Returns 0.0 once the swell is finished (age >= rise+fall)."""
+    if age < 0.0:
+        return 0.0
+    if age < CINE_RISE_S:
+        x = age / CINE_RISE_S
+        return x * x * (3.0 - 2.0 * x)
+    fall_age = age - CINE_RISE_S
+    if fall_age >= CINE_FALL_S:
+        return 0.0
+    x = 1.0 - fall_age / CINE_FALL_S
+    return x * x * (3.0 - 2.0 * x)
 
 
 # P0-3: bloom_attack is currently unused after the sync fix removed it from
@@ -251,6 +281,12 @@ class DmxEngineBase:
         self._ga_last_render_t = None      # last t this renderer was called with
         self._ga_loud_ref = 1e-6           # running loudness peak (self-normalizing, never zero)
 
+        # cinematic_swell renderer state
+        self._cs_swell_age = None          # None = idle; else seconds since trigger
+        self._cs_swell_peak = 0.0          # velocity-scaled peak fraction for the active swell
+        self._cs_drift_phase = 0.0         # 0..1 idle floor drift position
+        self._cs_last_render_t = None      # last t this renderer was called with
+
         # Playback / IPC state
         self.playback_position = 0.0
         self.playback_duration = 0.0
@@ -279,6 +315,7 @@ class DmxEngineBase:
             "aurora_shimmer": self._render_aurora_shimmer,
             "abyssal_bloom": self._render_abyssal_bloom,
             "golden_anthem": self._render_golden_anthem,
+            "cinematic_swell": self._render_cinematic_swell,
         }
 
     def _init_hardware(self):
@@ -938,6 +975,63 @@ class DmxEngineBase:
         self.out_b = ema(self.out_b, gold[2] * brightness, 0.04, 0.03)
         self.out_w = ema(self.out_w, 120.0 * shimmer * dimmer, 0.06, 0.05)
         self.out_master = ema(self.out_master, 255.0 * brightness, 0.04, 0.03)
+        self.out_strobe = 0
+
+    def _render_cinematic_swell(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                                kick_color, accent_color, volume, cue, t):
+        """Film-score mode: a dim floor that drifts slowly between the palette
+        colors, plus a wide eased swell toward the accent color fired only by
+        STRONG kicks (velocity-gated). Rise ~0.5s / fall ~1.4s -- a slow-motion
+        impact, never a flash. Accumulated dt (golden_anthem pattern): seeks
+        and rotation re-entry advance progress by at most one nominal frame."""
+        dimmer = (cue.get("dimmer", 60) if cue else 60) / 100.0
+
+        if (self._cs_last_render_t is None or
+                abs(t - self._cs_last_render_t) > CINE_DISCONTINUITY_THRESHOLD):
+            dt = 0.012
+        else:
+            dt = min(max(t - self._cs_last_render_t, 0.0), CINE_DT_CLAMP)
+        self._cs_last_render_t = t
+
+        # --- Trigger: strong kicks only. Retrigger mid-swell only if the new
+        # hit would out-peak what's left of the current swell (no stacking).
+        if is_kick and self._beat_velocity >= CINE_TRIGGER_VELOCITY:
+            new_peak = min(CINE_PEAK_MAX, velocity_brightness(self._beat_velocity) / 255.0)
+            if self._cs_swell_age is None:
+                self._cs_swell_age = 0.0
+                self._cs_swell_peak = new_peak
+            elif new_peak > self._cs_swell_peak * _cine_envelope(self._cs_swell_age):
+                self._cs_swell_age = 0.0
+                self._cs_swell_peak = new_peak
+
+        # --- Advance swell + idle drift by clamped dt.
+        swell = 0.0
+        if self._cs_swell_age is not None:
+            self._cs_swell_age += dt
+            env = _cine_envelope(self._cs_swell_age)
+            if self._cs_swell_age >= CINE_RISE_S + CINE_FALL_S:
+                self._cs_swell_age = None
+            swell = env * self._cs_swell_peak
+        self._cs_drift_phase = (self._cs_drift_phase + dt / CINE_DRIFT_PERIOD_S) % 1.0
+
+        # --- Floor: slow triangle-wave drift color_1 <-> color_2.
+        tri = 1.0 - abs(2.0 * self._cs_drift_phase - 1.0)
+        floor_color = lerp_color(kick_color, accent_color, tri * 0.6)
+        # Floor is NOT dimmer-scaled (PWM-visibility lesson from abyssal_bloom).
+        floor_b = CINE_FLOOR_MIN
+
+        # --- Swell lifts brightness toward the accent color; never darkens floor.
+        swell_color = lerp_color(floor_color, accent_color, min(1.0, swell * 1.5))
+        brightness = max(floor_b, swell * dimmer)
+        col = swell_color if swell > 0.0 else floor_color
+
+        self.out_r = ema(self.out_r, col[0] * brightness, 0.08, 0.05)
+        self.out_g = ema(self.out_g, col[1] * brightness, 0.08, 0.05)
+        self.out_b = ema(self.out_b, col[2] * brightness, 0.08, 0.05)
+        # White only near the swell peak (shimmer precedent from golden_anthem).
+        white = CINE_WHITE_PEAK * max(0.0, swell - 0.7) / 0.3 * dimmer
+        self.out_w = ema(self.out_w, white, 0.08, 0.06)
+        self.out_master = ema(self.out_master, 255.0 * brightness, 0.08, 0.05)
         self.out_strobe = 0
 
     def load_ai_show(self, show_file="current_show.json"):
