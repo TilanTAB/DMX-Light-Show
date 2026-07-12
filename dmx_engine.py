@@ -226,7 +226,7 @@ def bloom_attack(current, target, speed=0.85):
 import bisect
 import zlib
 from dmx_variety import VarietyEngine
-from dmx_punch import velocity_brightness, afterglow
+from dmx_punch import velocity_brightness, afterglow, beat_velocity_from_ratio
 
 
 class DmxEngineBase:
@@ -1297,8 +1297,14 @@ class DmxEngineBase:
         beats_per_sec = len(self.beat_timestamps) / 3.0
 
         # --- Velocity + BPS for the variety/punch layer, then dispatch ---
-        kick_velocity = min(1.0, kick_i / max(self.profile_kick_thresh, 0.01))
-        snare_velocity = min(1.0, snare_i / max(self.profile_snare_thresh, 0.01))
+        # Velocity measures how far the onset EXCEEDS its detection threshold
+        # (see beat_velocity_from_ratio in dmx_punch.py). The old
+        # min(1, intensity/thresh) form pinned velocity at 1.0 on every onset
+        # frame because is_kick/is_snare already require intensity > thresh.
+        kick_ratio = kick_i / max(self.profile_kick_thresh, 0.01)
+        snare_ratio = snare_i / max(self.profile_snare_thresh, 0.01)
+        kick_velocity = beat_velocity_from_ratio(kick_ratio)
+        snare_velocity = beat_velocity_from_ratio(snare_ratio)
         self._beat_velocity = max(kick_velocity, snare_velocity)
         self.beats_per_sec = beats_per_sec
 

@@ -5,6 +5,20 @@ can use it too. Pure functions — no engine state, easy to unit-test."""
 VELOCITY_FLOOR = 120.0
 VELOCITY_FULL = 255.0
 
+# _beat_velocity measures onset strength ABOVE the detection threshold.
+# Raw min(1, kick_i/thresh) clamps to exactly 1.0 on every onset frame
+# (is_kick already requires kick_i > thresh), which made velocity_brightness
+# a constant 255 in live playback. Map the threshold-excess ratio instead:
+# ratio 1.0 (barely fired) -> velocity 0.0, ratio >= PUNCH_FULL_RATIO -> 1.0.
+PUNCH_FULL_RATIO = 3.0
+
+
+def beat_velocity_from_ratio(ratio):
+    """Map an intensity/threshold ratio to a 0..1 beat velocity.
+    ratio <= 1.0 (at or below the onset threshold) -> 0.0;
+    ratio >= PUNCH_FULL_RATIO -> 1.0; linear in between."""
+    return min(1.0, max(0.0, (ratio - 1.0) / (PUNCH_FULL_RATIO - 1.0)))
+
 
 def velocity_brightness(beat_velocity):
     """Map a 0..1 beat velocity to master brightness 120..255.
