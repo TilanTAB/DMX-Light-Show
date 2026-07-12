@@ -36,7 +36,7 @@ os.environ["DMX_DRY_RUN"] = "1"
 
 import dmx_engine
 from dmx_engine import (
-    _cine_envelope, CINE_TRIGGER_VELOCITY, CINE_RISE_S, CINE_FALL_S,
+    _cine_envelope, CINE_TRIGGER_RATIO, CINE_FULL_RATIO, CINE_RISE_S, CINE_FALL_S,
     CINE_FLOOR_MIN, CINE_PEAK_MAX, VALID_BEHAVIORS,
 )
 
@@ -66,8 +66,9 @@ def test_weak_hit_does_not_start_swell():
     eng = make_engine()
     run_frames(eng, 50)                                   # settle at floor
     floor_master = eng.out_master
-    run_frames(eng, 50, t0=0.6, velocity=CINE_TRIGGER_VELOCITY - 0.1,
-               kick_first=True)
+    # Post-review fix: drive kick_i (ratio 1.2 < CINE_TRIGGER_RATIO) with
+    # _beat_velocity = 1.0 on the kick frame, mirroring reality.
+    run_frames(eng, 50, t0=0.6, kick_i=0.12, kick_first=True)
     # A sub-threshold kick must not lift master meaningfully above the floor.
     assert eng.out_master < floor_master + 20.0
 
@@ -116,7 +117,7 @@ def test_stronger_hit_peaks_higher():
             peak = max(peak, eng.out_master)
             t += 0.012
         return peak
-    assert peak_for(1.0) > peak_for(CINE_TRIGGER_VELOCITY + 0.05) + 10.0
+    assert peak_for(0.32) > peak_for(0.20) + 10.0  # kick_i ratios 3.2 vs 2.0
 
 
 def test_discontinuity_guard_on_seek():
@@ -163,7 +164,10 @@ Insert immediately after `ANTHEM_DISCONTINUITY_THRESHOLD` (line 90):
 # and a slow eased swell (rise + fall, ~2s total) fired only by STRONG kicks.
 # Accumulated-dt like golden_anthem: swell/drift progress advances by clamped
 # per-frame dt, so seeks and ambient-rotation re-entry cannot corrupt it.
-CINE_TRIGGER_VELOCITY = 0.55  # min _beat_velocity to start a swell
+# NOTE (post-review fix): the gate uses the RAW kick ratio, not _beat_velocity —
+# velocity clamps to 1.0 on every onset frame by construction, so it cannot gate.
+CINE_TRIGGER_RATIO = 1.6      # kick_i must exceed 1.6x onset threshold to swell
+CINE_FULL_RATIO = 3.0         # ratio at which the swell peaks at max
 CINE_RISE_S = 0.5             # eased rise duration (seconds)
 CINE_FALL_S = 1.4             # eased fall duration (seconds)
 CINE_FLOOR_MIN = 0.08         # never-dark floor (not dimmer-scaled; abyssal PWM lesson)
@@ -226,8 +230,13 @@ Insert immediately after `self._ga_loud_ref = 1e-6` (line 252):
 
         # --- Trigger: strong kicks only. Retrigger mid-swell only if the new
         # hit would out-peak what's left of the current swell (no stacking).
-        if is_kick and self._beat_velocity >= CINE_TRIGGER_VELOCITY:
-            new_peak = min(CINE_PEAK_MAX, velocity_brightness(self._beat_velocity) / 255.0)
+        # Post-review fix: gate on the RAW kick ratio (velocity clamps to 1.0
+        # on every onset frame); strength maps ratio -> 0..1 between the two.
+        ratio = kick_i / max(self.profile_kick_thresh, 0.01)
+        if is_kick and ratio >= CINE_TRIGGER_RATIO:
+            strength = min(1.0, (ratio - CINE_TRIGGER_RATIO) /
+                           (CINE_FULL_RATIO - CINE_TRIGGER_RATIO))
+            new_peak = min(CINE_PEAK_MAX, velocity_brightness(strength) / 255.0)
             if self._cs_swell_age is None:
                 self._cs_swell_age = 0.0
                 self._cs_swell_peak = new_peak

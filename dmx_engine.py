@@ -93,13 +93,19 @@ ANTHEM_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => treat as one nominal 
 # and a slow eased swell (rise + fall, ~2s total) fired only by STRONG kicks.
 # Accumulated-dt like golden_anthem: swell/drift progress advances by clamped
 # per-frame dt, so seeks and ambient-rotation re-entry cannot corrupt it.
-CINE_TRIGGER_VELOCITY = 0.55  # min _beat_velocity to start a swell
+# Gate on the RAW kick ratio, not _beat_velocity: process_audio computes
+# velocity = min(1.0, kick_i / kick_thresh), and is_kick already requires
+# kick_i > kick_thresh -- so velocity clamps to exactly 1.0 on every onset
+# frame by construction and can never distinguish weak from strong hits.
+CINE_TRIGGER_RATIO = 1.6      # kick_i must exceed 1.6x onset threshold to swell
+CINE_FULL_RATIO = 3.0         # ratio at which the swell peaks at max
 CINE_RISE_S = 0.5             # eased rise duration (seconds)
 CINE_FALL_S = 1.4             # eased fall duration (seconds)
 CINE_FLOOR_MIN = 0.08         # never-dark floor (not dimmer-scaled; abyssal PWM lesson)
 CINE_PEAK_MAX = 0.90          # hard cap on swell peak brightness fraction
 CINE_DRIFT_PERIOD_S = 20.0    # idle floor drifts color_1 <-> color_2 this slowly
 CINE_WHITE_PEAK = 100.0       # max white-channel lift at swell peak
+CINE_WHITE_KNEE = 0.7         # white ramps in above this swell level (up to PEAK_MAX)
 CINE_DT_CLAMP = 0.1           # max seconds of progress per frame
 CINE_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => one nominal frame
 
@@ -185,6 +191,24 @@ def _cine_envelope(age):
         return 0.0
     x = 1.0 - fall_age / CINE_FALL_S
     return x * x * (3.0 - 2.0 * x)
+
+
+def _cine_rise_age_for(env_frac):
+    """Inverse of the rise segment of _cine_envelope: the age in
+    [0, CINE_RISE_S] whose envelope equals env_frac. Used by sag-free
+    retrigger: resume the rise at the height already on the lights.
+    Smoothstep has no closed-form inverse; bisection (monotone on the
+    rise) converges to ~5e-7 s in 20 iterations."""
+    env_frac = max(0.0, min(1.0, env_frac))
+    lo, hi = 0.0, CINE_RISE_S
+    for _ in range(20):
+        mid = (lo + hi) / 2.0
+        x = mid / CINE_RISE_S
+        if x * x * (3.0 - 2.0 * x) < env_frac:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
 
 
 # P0-3: bloom_attack is currently unused after the sync fix removed it from
@@ -993,16 +1017,28 @@ class DmxEngineBase:
             dt = min(max(t - self._cs_last_render_t, 0.0), CINE_DT_CLAMP)
         self._cs_last_render_t = t
 
-        # --- Trigger: strong kicks only. Retrigger mid-swell only if the new
-        # hit would out-peak what's left of the current swell (no stacking).
-        if is_kick and self._beat_velocity >= CINE_TRIGGER_VELOCITY:
-            new_peak = min(CINE_PEAK_MAX, velocity_brightness(self._beat_velocity) / 255.0)
+        # --- Trigger: strong kicks only, gated on the RAW kick ratio.
+        # _beat_velocity is useless here: it clamps to 1.0 on every onset
+        # frame (is_kick requires kick_i > thresh, velocity = min(1, kick_i/
+        # thresh)), so weak and strong hits are indistinguishable through it.
+        ratio = kick_i / max(self.profile_kick_thresh, 0.01)
+        if is_kick and ratio >= CINE_TRIGGER_RATIO:
+            strength = min(1.0, (ratio - CINE_TRIGGER_RATIO) /
+                           (CINE_FULL_RATIO - CINE_TRIGGER_RATIO))
+            new_peak = min(CINE_PEAK_MAX, velocity_brightness(strength) / 255.0)
             if self._cs_swell_age is None:
                 self._cs_swell_age = 0.0
                 self._cs_swell_peak = new_peak
-            elif new_peak > self._cs_swell_peak * _cine_envelope(self._cs_swell_age):
-                self._cs_swell_age = 0.0
-                self._cs_swell_peak = new_peak
+            else:
+                # Retrigger only if the new hit out-peaks what's left of the
+                # current swell -- and resume the rise at the age whose
+                # envelope matches the height already on the lights, so
+                # output never sags backward mid-rise.
+                env_now_abs = self._cs_swell_peak * _cine_envelope(self._cs_swell_age)
+                if new_peak > env_now_abs:
+                    self._cs_swell_age = _cine_rise_age_for(
+                        min(1.0, env_now_abs / new_peak))
+                    self._cs_swell_peak = new_peak
 
         # --- Advance swell + idle drift by clamped dt.
         swell = 0.0
@@ -1025,11 +1061,15 @@ class DmxEngineBase:
         brightness = max(floor_b, swell * dimmer)
         col = swell_color if swell > 0.0 else floor_color
 
+        # EMA lag stretches the effective rise to ~0.7s, reaching ~93% of the
+        # envelope target -- intentional aesthetic slack, not a bug.
         self.out_r = ema(self.out_r, col[0] * brightness, 0.08, 0.05)
         self.out_g = ema(self.out_g, col[1] * brightness, 0.08, 0.05)
         self.out_b = ema(self.out_b, col[2] * brightness, 0.08, 0.05)
         # White only near the swell peak (shimmer precedent from golden_anthem).
-        white = CINE_WHITE_PEAK * max(0.0, swell - 0.7) / 0.3 * dimmer
+        # Normalized to PEAK_MAX so full-strength swells reach CINE_WHITE_PEAK.
+        white = (CINE_WHITE_PEAK * max(0.0, swell - CINE_WHITE_KNEE) /
+                 (CINE_PEAK_MAX - CINE_WHITE_KNEE) * dimmer)
         self.out_w = ema(self.out_w, white, 0.08, 0.06)
         self.out_master = ema(self.out_master, 255.0 * brightness, 0.08, 0.05)
         self.out_strobe = 0

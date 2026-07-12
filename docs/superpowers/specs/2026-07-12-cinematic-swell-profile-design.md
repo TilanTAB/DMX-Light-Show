@@ -21,9 +21,9 @@ A shared-base renderer beside `_render_abyssal_bloom` / `_render_golden_anthem`.
 ### Behavior
 
 - **Floor:** dim warm ambient wash of `color_1` at a never-dark floor (like ANTHEM_FLOOR_MIN precedent — floor NOT dimmer-scaled), with a very slow drift between `color_1` and `color_2` so idle passages still breathe.
-- **Trigger:** a swell starts when a kick arrives with `self._beat_velocity >= CINE_TRIGGER_VELOCITY` (strong hits only — weak beats do nothing). While a swell is active, new triggers only *retrigger/extend* if the new hit is stronger than the current swell's remaining peak (no machine-gun stacking).
-- **Envelope:** eased (smoothstep) rise over `CINE_RISE_S` (~0.5 s) to a velocity-scaled peak, then eased fall over `CINE_FALL_S` (~1.4 s) back to the floor. Total ~2 s — a film-score hit, never a strobe.
-- **Color:** swell blends from the floor color toward the **accent** color from `current_colors()` (palette-aware, like golden_anthem); peak brightness scales with the triggering hit's velocity via `dmx_punch.velocity_brightness` semantics (reuse the module, don't inline 120+135·v — review debt from the last branch).
+- **Trigger:** a swell starts when a kick arrives with `kick_i / kick_thresh >= CINE_TRIGGER_RATIO` (strong hits only — weak beats do nothing). Rationale: `_beat_velocity` clamps to 1.0 on every onset frame by construction (is_kick already requires kick_i > thresh), so the gate must use the raw ratio, not the clamped velocity. While a swell is active, new triggers only *retrigger/extend* if the new hit is stronger than the current swell's remaining peak (no machine-gun stacking), resuming the rise at the current output height (no backward sag).
+- **Envelope:** eased (smoothstep) rise over `CINE_RISE_S` (~0.5 s) to a ratio-scaled peak, then eased fall over `CINE_FALL_S` (~1.4 s) back to the floor. Total ~2 s — a film-score hit, never a strobe.
+- **Color:** swell blends from the floor color toward the **accent** color from `current_colors()` (palette-aware, like golden_anthem); peak brightness scales with the triggering hit's strength (mapped from the kick ratio between `CINE_TRIGGER_RATIO` and `CINE_FULL_RATIO`) via `dmx_punch.velocity_brightness` semantics (reuse the module, don't inline 120+135·v — review debt from the last branch).
 - **White channel:** small white lift near swell peak only (shimmer precedent from golden_anthem), scaled by dimmer.
 - **Strobe:** always 0.
 - **Time handling:** accumulated-phase / dt-clamped like golden_anthem (`CINE_DT_CLAMP`, discontinuity threshold ⇒ one nominal frame) so seeks and rotation re-entry are immune by construction. Swell progress advances by clamped per-frame dt, not absolute t.
@@ -32,7 +32,9 @@ A shared-base renderer beside `_render_abyssal_bloom` / `_render_golden_anthem`.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `CINE_TRIGGER_VELOCITY` | 0.55 | min `_beat_velocity` to start a swell |
+| `CINE_TRIGGER_RATIO` | 1.6 | kick_i must exceed this × onset threshold to start a swell (velocity clamps to 1.0 on onset frames, so the gate uses the raw ratio) |
+| `CINE_FULL_RATIO` | 3.0 | ratio at which the swell peaks at max |
+| `CINE_WHITE_KNEE` | 0.7 | white ramps in above this swell level (normalized to `CINE_PEAK_MAX`) |
 | `CINE_RISE_S` | 0.5 | eased rise duration |
 | `CINE_FALL_S` | 1.4 | eased fall duration |
 | `CINE_FLOOR_MIN` | 0.08 | never-dark floor (not dimmer-scaled) |
@@ -64,12 +66,12 @@ New profile file (auto-discovered by `app.py` `list_profiles()` — dropdown gai
 
 ## Testing (TDD, tests/test_cinematic_swell.py)
 
-1. Weak hit (`_beat_velocity < CINE_TRIGGER_VELOCITY`) does not start a swell — output stays at floor.
+1. Weak hit (`kick_i / kick_thresh < CINE_TRIGGER_RATIO`) does not start a swell — output stays at floor.
 2. Strong hit starts a swell; master rises smoothly (no frame-to-frame jump > a bound) and peaks ≤ `CINE_PEAK_MAX`.
 3. Swell decays back to floor within rise+fall duration (+EMA slack); floor holds at `CINE_FLOOR_MIN` when dimmer is 0.
 4. Seek/re-entry: a 60 s jump in `t` advances swell/drift phase by ≤ one nominal frame (discontinuity guard).
 5. Registration: `"cinematic_swell"` in `dmx_engine.VALID_BEHAVIORS`, `_behavior_map`, and llm_designer's `VALID_BEHAVIORS`; `_validate_and_repair_plan` preserves it.
-6. Energy differentiation is N/A (hit-triggered, not envelope-followed) — instead: a stronger velocity yields a higher swell peak than a weaker one (both above trigger).
+6. Energy differentiation is N/A (hit-triggered, not envelope-followed) — instead: a stronger kick ratio yields a higher swell peak than a weaker one (both above trigger).
 
 ## Verification
 

@@ -1,31 +1,39 @@
 """cinematic_swell: calm drifting floor + eased swells on strong kicks only.
-Pins: trigger threshold, peak cap, smooth rise (no instant flash), decay back
-to floor, velocity-scaled peaks, discontinuity guard, registration."""
+Pins: ratio-based trigger gate (kick_i vs onset threshold -- _beat_velocity
+clamps to 1.0 on every onset frame, so it cannot gate anything), peak cap,
+smooth rise (no instant flash), decay back to floor, ratio-scaled peaks,
+sag-free mid-rise retrigger, discontinuity guard, registration."""
 import os
 os.environ["DMX_DRY_RUN"] = "1"
 
 import dmx_engine
 from dmx_engine import (
-    DmxEngineBase, _cine_envelope, CINE_TRIGGER_VELOCITY, CINE_RISE_S,
+    DmxEngineBase, _cine_envelope, _cine_rise_age_for,
+    CINE_TRIGGER_RATIO, CINE_FULL_RATIO, CINE_RISE_S,
     CINE_FALL_S, CINE_FLOOR_MIN, CINE_PEAK_MAX, VALID_BEHAVIORS,
 )
 
 
 def make_engine():
     # test_golden_anthem.py constructs DmxEngineBase() directly -- same here.
-    return DmxEngineBase()
+    eng = DmxEngineBase()
+    eng.profile_kick_thresh = 0.10  # explicit: ratio math depends on it
+    return eng
 
 
-def run_frames(eng, n, t0=0.0, velocity=0.0, kick_first=False, dt=0.012):
-    """Drive the renderer directly for n frames; returns final t."""
+def run_frames(eng, n, t0=0.0, kick_i=0.0, kick_first=False, dt=0.012):
+    """Drive the renderer directly for n frames; returns final t.
+    On the kick frame, _beat_velocity = 1.0 mirrors reality: process_audio
+    computes min(1.0, kick_i/thresh), which clamps to 1.0 whenever is_kick."""
     t = t0
     for i in range(n):
-        eng._beat_velocity = velocity if (kick_first and i == 0) else 0.0
+        hit = kick_first and i == 0
+        eng._beat_velocity = 1.0 if hit else 0.0
         eng._render_cinematic_swell(
-            0.0, 0.0, 0.0, 0.1,                  # kick_i, snare_i, hihat_i, mid_i
-            kick_first and i == 0, False,         # is_kick, is_snare
-            (255, 140, 20), (0, 120, 140),        # kick_color, accent_color
-            0.05, {"dimmer": 80}, t)              # volume, cue, t
+            kick_i if hit else 0.0, 0.0, 0.0, 0.1,  # kick_i, snare_i, hihat_i, mid_i
+            hit, False,                              # is_kick, is_snare
+            (255, 140, 20), (0, 120, 140),           # kick_color, accent_color
+            0.05, {"dimmer": 80}, t)                 # volume, cue, t
         t += dt
     return t
 
@@ -34,9 +42,9 @@ def test_weak_hit_does_not_start_swell():
     eng = make_engine()
     run_frames(eng, 50)                                   # settle at floor
     floor_master = eng.out_master
-    run_frames(eng, 50, t0=0.6, velocity=CINE_TRIGGER_VELOCITY - 0.1,
-               kick_first=True)
-    # A sub-threshold kick must not lift master meaningfully above the floor.
+    # kick_i=0.12 -> ratio 1.2 < CINE_TRIGGER_RATIO (1.6): a real but weak
+    # onset (is_kick True, velocity clamped to 1.0) must not start a swell.
+    run_frames(eng, 50, t0=0.6, kick_i=0.12, kick_first=True)
     assert eng.out_master < floor_master + 20.0
 
 
@@ -48,8 +56,11 @@ def test_strong_hit_swells_smoothly_and_caps():
     peak = 0.0
     t = 0.6
     for i in range(200):                                  # ~2.4s of frames
-        eng._beat_velocity = 0.9 if i == 0 else 0.0
-        eng._render_cinematic_swell(0.0, 0.0, 0.0, 0.1, i == 0, False,
+        hit = i == 0
+        eng._beat_velocity = 1.0 if hit else 0.0
+        # kick_i=0.32 -> ratio 3.2 >= CINE_FULL_RATIO: full-strength swell.
+        eng._render_cinematic_swell(0.32 if hit else 0.0, 0.0, 0.0, 0.1,
+                                    hit, False,
                                     (255, 140, 20), (0, 120, 140),
                                     0.05, {"dimmer": 80}, t)
         max_jump = max(max_jump, abs(eng.out_master - prev))
@@ -67,35 +78,69 @@ def test_swell_decays_back_to_floor():
     floor_master = eng.out_master
     # Trigger, then run well past rise+fall (+EMA slack).
     total_frames = int((CINE_RISE_S + CINE_FALL_S) / 0.012) + 300
-    run_frames(eng, total_frames, t0=0.6, velocity=0.9, kick_first=True)
+    run_frames(eng, total_frames, t0=0.6, kick_i=0.32, kick_first=True)
     assert abs(eng.out_master - floor_master) < 15.0
 
 
 def test_stronger_hit_peaks_higher():
-    def peak_for(v):
+    def peak_for(kick_i):
         eng = make_engine()
         run_frames(eng, 50)
         peak, t = 0.0, 0.6
         for i in range(200):
-            eng._beat_velocity = v if i == 0 else 0.0
-            eng._render_cinematic_swell(0.0, 0.0, 0.0, 0.1, i == 0, False,
+            hit = i == 0
+            eng._beat_velocity = 1.0 if hit else 0.0
+            eng._render_cinematic_swell(kick_i if hit else 0.0, 0.0, 0.0, 0.1,
+                                        hit, False,
                                         (255, 140, 20), (0, 120, 140),
                                         0.05, {"dimmer": 80}, t)
             peak = max(peak, eng.out_master)
             t += 0.012
         return peak
-    assert peak_for(1.0) > peak_for(CINE_TRIGGER_VELOCITY + 0.05) + 10.0
+    # ratio 3.2 (full) must clearly out-peak ratio 2.0 (mid-strength).
+    assert peak_for(0.32) > peak_for(0.20) + 10.0
+
+
+def test_retrigger_mid_rise_never_sags():
+    # A second, stronger hit mid-rise must not pull output backward: the
+    # rise resumes from the age matching the current height (I2 fix).
+    eng = make_engine()
+    run_frames(eng, 50)
+    t = 0.6
+    prev = eng.out_master
+    sagged = False
+    rise_frames = int(CINE_RISE_S / 0.012)
+    for i in range(200):
+        hit = i in (0, 20)                    # second hit ~0.24s in, mid-rise
+        eng._beat_velocity = 1.0 if hit else 0.0
+        kick_i = (0.20 if i == 0 else 0.40) if hit else 0.0
+        eng._render_cinematic_swell(kick_i, 0.0, 0.0, 0.1, hit, False,
+                                    (255, 140, 20), (0, 120, 140),
+                                    0.05, {"dimmer": 80}, t)
+        # Monotone from first hit through the end of the retriggered rise;
+        # the natural fall afterwards is allowed to decrease, of course.
+        if i <= 20 + rise_frames and eng.out_master < prev - 1.0:
+            sagged = True
+        prev = eng.out_master
+        t += 0.012
+    assert not sagged
 
 
 def test_discontinuity_guard_on_seek():
     eng = make_engine()
-    run_frames(eng, 50)
+    # Start a swell so we can also pin the swell-age advance across the jump.
+    run_frames(eng, 10, kick_i=0.32, kick_first=True)
     drift_before = eng._cs_drift_phase
-    # One frame with t jumped 60s ahead: drift must advance <= one nominal frame.
+    age_before = eng._cs_swell_age
+    assert age_before is not None
+    # One frame with t jumped 60s ahead: everything advances one nominal frame.
     eng._render_cinematic_swell(0.0, 0.0, 0.0, 0.1, False, False,
                                 (255, 140, 20), (0, 120, 140),
                                 0.05, {"dimmer": 80}, 60.6)
-    assert abs(eng._cs_drift_phase - drift_before) < 0.01
+    # One nominal frame of drift is 0.012/20 = 0.0006 -- the DT clamp alone
+    # (0.1/20 = 0.005) would fail this bound; only the guard passes it.
+    assert abs(eng._cs_drift_phase - drift_before) < 0.002
+    assert eng._cs_swell_age - age_before <= 0.013
 
 
 def test_floor_never_dark_at_dimmer_zero():
@@ -107,6 +152,14 @@ def test_floor_never_dark_at_dimmer_zero():
                                     0.05, {"dimmer": 0}, t)
         t += 0.012
     assert eng.out_master >= 255.0 * CINE_FLOOR_MIN - 5.0
+
+
+def test_rise_age_inversion_matches_envelope():
+    # _cine_rise_age_for is the smoothstep inverse on the rise segment.
+    for frac in (0.0, 0.1, 0.35, 0.5, 0.72, 0.9, 1.0):
+        age = _cine_rise_age_for(frac)
+        assert 0.0 <= age <= CINE_RISE_S
+        assert abs(_cine_envelope(age) - frac) < 1e-4
 
 
 def test_registered_in_engine():
