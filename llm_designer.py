@@ -313,6 +313,10 @@ Use these for quiet sections, breakdowns, lo-fi, acoustic, and ambient music.
   USE FOR: Finales, euphoric sing-along/anthem moments, emotional breakdowns, sunset sets.
   FEEL: Majestic, golden, hands-in-the-air. The whole crowd swaying as one.
 
+"cinematic_swell" — Calm dim floor drifting slowly between the palette colors; a STRONG bass hit triggers one slow, wide swell toward the accent color (rise ~0.5s, fall ~1.4s), like a film-score impact in slow motion. Weak beats do nothing. No strobe, no flashing.
+  USE FOR: Cinematic tension-building sections, dramatic intros, half-time or stripped-back breakdowns, trailer-style moments.
+  FEEL: Widescreen, slow-motion impact. Every hit feels earned.
+
 === NARRATIVE ARC TEMPLATE ===
 A well-designed show follows this emotional curve:
   Intro: ocean_drift or aurora_shimmer (gentle, mysterious)
@@ -454,7 +458,7 @@ VALID_BEHAVIORS = {
     "beat_reactive", "bass_white_blast", "blackout_punch",
     # Ambient/chill behaviors
     "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
-    "golden_anthem",
+    "golden_anthem", "cinematic_swell",
 }
 
 
