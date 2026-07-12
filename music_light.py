@@ -11,6 +11,7 @@ from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
                         LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
                         DRY_RUN)
 from dmx_variety import Intent
+from dmx_punch import beat_velocity_from_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -192,8 +193,10 @@ class DMXEngine(DmxEngineBase):
         is_deep_bass = self.profile_deep_bass_enabled and self.peak_kick > 0.00001 and (kick_mag / self.peak_kick) > self.profile_deep_bass_thresh
 
         # S4: Velocity-sensitive brightness — soft beats get dim, hard beats get blast.
-        kick_velocity = min(1.0, kick_i / max(self.profile_kick_thresh, 0.01))
-        snare_velocity = min(1.0, snare_i / max(self.profile_snare_thresh, 0.01))
+        # Velocity measures threshold EXCESS (beat_velocity_from_ratio); the old
+        # min(1, intensity/thresh) form pinned it at 1.0 on every onset frame.
+        kick_velocity = beat_velocity_from_ratio(kick_i / max(self.profile_kick_thresh, 0.01))
+        snare_velocity = beat_velocity_from_ratio(snare_i / max(self.profile_snare_thresh, 0.01))
         beat_velocity = max(kick_velocity, snare_velocity)
         velocity_brightness = 120.0 + (135.0 * beat_velocity)
 

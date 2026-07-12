@@ -68,6 +68,32 @@ def test_velocity_monotone_in_ratio():
     vels = [beat_velocity_from_ratio(r) for r in ratios]
     assert all(b >= a for a, b in zip(vels, vels[1:]))
 
+def test_loopback_direct_master_graded_by_kick_strength():
+    # music_light's live loopback path had its OWN local copy of the pinned
+    # formula: a barely-over-threshold kick and a 3x kick both rendered master
+    # 255. The direct renderer must grade brightness by threshold excess.
+    from music_light import DMXEngine
+    def master_for(kick_i_mult):
+        e = DMXEngine()
+        e.profile_deep_bass_enabled = False   # take the NORMAL BEAT branch
+        kick_i = e.profile_kick_thresh * kick_i_mult
+        e._render_loopback_direct(0.5, 0, 0, 0, kick_i, 0.0, 0, 0,
+                                  True, False,
+                                  (255, 0, 120), (0, 220, 255), (255, 255, 0),
+                                  0.05, 1.0)
+        return e.out_master
+    soft = master_for(1.05)
+    hard = master_for(3.0)
+    assert soft < 135.0        # barely fired -> near the 120 floor
+    assert hard == 255.0       # 3x threshold -> full blast
+    assert soft < hard
+
+def test_loopback_direct_uses_shared_velocity_helper():
+    import inspect, music_light
+    src = inspect.getsource(music_light.DMXEngine._render_loopback_direct)
+    assert "beat_velocity_from_ratio" in src
+    assert "min(1.0, kick_i / max(self.profile_kick_thresh" not in src
+
 def test_process_audio_velocity_lines_use_helper():
     # Pin the wiring: process_audio must derive _beat_velocity from the
     # shared helper, not the old pinned-at-1.0 min() formula.
