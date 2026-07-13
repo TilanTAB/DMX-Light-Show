@@ -281,6 +281,10 @@ class DmxEngineBase:
         # Beat-hold shared by the punchy renderers (loopback overrides via profile)
         self.profile_beat_hold = 4
         self.beat_hold_frames = 0
+        # Master brightness of the hit that armed the current hold. The hold
+        # floor is capped at this so a soft (graded-velocity) hit decays from
+        # its own level instead of stepping UP to 200 a frame after the beat.
+        self._hold_master = 0.0
         # Variety engine (anti-monotony policy; shared by both modes)
         self.variety = VarietyEngine()
         self._last_section_id = None
@@ -543,10 +547,12 @@ class DmxEngineBase:
             self.out_w = 255.0 * dimmer
             self.out_master = velocity_brightness(self._beat_velocity) * dimmer
             self.beat_hold_frames = self.profile_beat_hold
+            self._hold_master = self.out_master
         elif self.beat_hold_frames > 0:
             self.beat_hold_frames -= 1
             self.out_w *= 0.80
-            self.out_master = max(self.out_master, 200.0 * dimmer)
+            # Hold floor never exceeds the arming hit's own brightness.
+            self.out_master = max(self.out_master, min(200.0 * dimmer, self._hold_master))
         else:
             self.out_w = ema(self.out_w, 0, 0, 0.35)
             self.out_master = ema(self.out_master, max(120.0 * dimmer, volume * 4000), 0.5, 0.15)
@@ -678,11 +684,13 @@ class DmxEngineBase:
         if is_beat:
             self.out_master = velocity_brightness(self._beat_velocity) * dimmer
             self.beat_hold_frames = self.profile_beat_hold
+            self._hold_master = self.out_master
         elif self.beat_hold_frames > 0:
             self.beat_hold_frames -= 1
             self.out_r, self.out_g, self.out_b, self.out_w = afterglow(
                 self.out_r, self.out_g, self.out_b, self.out_w)
-            self.out_master = max(self.out_master, 200.0 * dimmer)
+            # Hold floor never exceeds the arming hit's own brightness.
+            self.out_master = max(self.out_master, min(200.0 * dimmer, self._hold_master))
         else:
             self.out_master = ema(self.out_master, tm, 0.4, 0.12)
 

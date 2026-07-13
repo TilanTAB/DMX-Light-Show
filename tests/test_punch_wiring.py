@@ -88,6 +88,54 @@ def test_loopback_direct_master_graded_by_kick_strength():
     assert hard == 255.0       # 3x threshold -> full blast
     assert soft < hard
 
+# --- Beat-hold inversion: the hold floor must never exceed the brightness
+# of the hit that armed it. Before this fix a soft onset rendered ~120-199
+# on the hit frame and the hold clamp raised it to 200 on the NEXT frame --
+# a visible "double pulse" where the light brightens after the beat.
+
+def test_beat_reactive_soft_hit_hold_never_brighter_than_hit():
+    e = DmxEngineBase()
+    e._beat_velocity = 0.2
+    cue = {"energy": 7, "dimmer": 80}
+    e._render_beat_reactive(0.3, 0, 0, 0, True, False,
+                            (255, 0, 120), (0, 220, 255), 0.05, cue, 1.0)
+    hit_master = e.out_master
+    for i in range(e.profile_beat_hold):
+        e._render_beat_reactive(0.0, 0, 0, 0, False, False,
+                                (255, 0, 120), (0, 220, 255), 0.05, cue,
+                                1.0 + 0.02 * (i + 1))
+        assert e.out_master <= hit_master + 1e-9
+
+def test_bass_white_blast_soft_hit_hold_never_brighter_than_hit():
+    e = DmxEngineBase()
+    e._beat_velocity = 0.2
+    cue = {"energy": 7, "dimmer": 80}
+    e._render_bass_white_blast(0.3, 0, 0, 0, True, False,
+                               (255, 0, 120), (0, 220, 255), 0.05, cue, 1.0)
+    hit_master = e.out_master
+    for i in range(e.profile_beat_hold):
+        e._render_bass_white_blast(0.0, 0, 0, 0, False, False,
+                                   (255, 0, 120), (0, 220, 255), 0.05, cue,
+                                   1.0 + 0.02 * (i + 1))
+        assert e.out_master <= hit_master + 1e-9
+
+def test_loopback_direct_soft_hit_hold_never_brighter_than_hit():
+    from music_light import DMXEngine
+    e = DMXEngine()
+    e.profile_deep_bass_enabled = False
+    kick_i = e.profile_kick_thresh * 1.4   # soft onset: velocity 0.2
+    e._render_loopback_direct(0.5, 0, 0, 0, kick_i, 0.0, 0, 0,
+                              True, False,
+                              (255, 0, 120), (0, 220, 255), (255, 255, 0),
+                              0.05, 1.0)
+    hit_master = e.out_master
+    for i in range(e.profile_beat_hold):
+        e._render_loopback_direct(0.1, 0, 0, 0, 0.0, 0.0, 0, 0,
+                                  False, False,
+                                  (255, 0, 120), (0, 220, 255), (255, 255, 0),
+                                  0.05, 1.0 + 0.02 * (i + 1))
+        assert e.out_master <= hit_master + 1e-9
+
 def test_loopback_deep_bass_blast_stays_bright_on_soft_kick():
     # The deep-bass combo is a deliberately dramatic special blast (white 255).
     # Graded velocity must not dim it into mush: master keeps a 200 floor,

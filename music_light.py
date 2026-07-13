@@ -218,6 +218,7 @@ class DMXEngine(DmxEngineBase):
             self.out_master = max(200.0, velocity_brightness)
             self.out_strobe = 0
             self.beat_hold_frames = self.profile_deep_bass_hold
+            self._hold_master = self.out_master
             return
 
         # ── NORMAL BEAT: Instant color snap ──
@@ -228,6 +229,7 @@ class DMXEngine(DmxEngineBase):
             self.out_master = velocity_brightness
             self.out_strobe = 0
             self.beat_hold_frames = self.profile_beat_hold
+            self._hold_master = self.out_master
             return
 
         # ── HOLD after beat ──
@@ -241,7 +243,9 @@ class DMXEngine(DmxEngineBase):
             self.out_r *= 0.95
             self.out_g *= 0.88
             self.out_b *= 0.82
-            self.out_master = max(self.out_master, 200.0)  # Stay bright during hold
+            # Stay bright during hold -- but never brighter than the hit that
+            # armed it (soft graded-velocity hits must not step UP to 200).
+            self.out_master = max(self.out_master, min(200.0, self._hold_master))
             self.out_strobe = 0
             return
 

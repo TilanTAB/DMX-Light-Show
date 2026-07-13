@@ -167,3 +167,19 @@ def test_registered_in_engine():
     assert "cinematic_swell" in VALID_BEHAVIORS
     eng = make_engine()
     assert eng._behavior_map["cinematic_swell"] == eng._render_cinematic_swell
+
+
+def test_registered_in_llm_designer_repair_gate():
+    # Spec test item 5: the LLM repair pass must not downgrade
+    # cinematic_swell to beat_reactive (set-membership silently drops
+    # on merges -- this pins llm_designer's own VALID_BEHAVIORS).
+    import llm_designer
+    assert "cinematic_swell" in llm_designer.VALID_BEHAVIORS
+    plan = {"show_name": "t", "cues": [{
+        "start_time": 0, "end_time": 10,
+        "color_1": [255, 140, 20], "color_2": [0, 120, 140],
+        "energy": 5, "strobe": False, "behavior": "cinematic_swell",
+        "dimmer": 80, "fade_in": 1, "fade_out": 1,
+        "section_name": "intro", "mood": "dark"}]}
+    out = llm_designer._validate_and_repair_plan(plan)
+    assert out["cues"][0]["behavior"] == "cinematic_swell"
