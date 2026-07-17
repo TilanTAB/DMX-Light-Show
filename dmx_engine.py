@@ -110,6 +110,20 @@ CINE_WHITE_KNEE = 0.7         # white ramps in above this swell level (up to PEA
 CINE_DT_CLAMP = 0.1           # max seconds of progress per frame
 CINE_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => one nominal frame
 
+# ambient_pulse renderer tuning. Layered multi-band: kicks pulse master
+# (graded velocity), snares flip color, hi-hats shimmer white, mids breathe
+# the floor. Accumulated-dt (sibling pattern): timers/drift advance by a
+# clamped per-frame dt, so seeks and re-entry cannot corrupt them.
+PULSE_FLOOR_MIN = 0.10        # breathing floor minimum (not dimmer-scaled)
+PULSE_FLOOR_MAX = 0.35        # floor at sustained loud mids
+PULSE_DRIFT_PERIOD_S = 16.0   # floor color drift period
+PULSE_KICK_DECAY = 0.10       # per-frame exponential decay of the kick pulse
+PULSE_SNARE_FLIP_S = 0.3      # how long a snare holds the accent color
+PULSE_HIHAT_THRESH = 0.5      # hihat intensity gate for shimmer
+PULSE_WHITE_SPIKE = 80.0      # white channel spike on shimmer
+PULSE_DT_CLAMP = 0.1          # max accumulated-dt advance per frame
+PULSE_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => one nominal frame
+
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
     ((255, 0, 50), (0, 150, 255)),     # Red vs Blue
@@ -128,7 +142,7 @@ VALID_BEHAVIORS = {
     "beat_reactive", "rainbow_sweep", "instant_flash",
     # Ambient/chill behaviors
     "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
-    "golden_anthem", "cinematic_swell",
+    "golden_anthem", "cinematic_swell", "ambient_pulse",
 }
 
 
@@ -316,6 +330,13 @@ class DmxEngineBase:
         self._cs_drift_phase = 0.0         # 0..1 idle floor drift position
         self._cs_last_render_t = None      # last t this renderer was called with
 
+        # ambient_pulse renderer state
+        self._ap_floor_energy = 0.0        # slow EMA of mid_i (breathing floor)
+        self._ap_drift_phase = 0.0         # 0..1 floor color drift position
+        self._ap_pulse_level = 0.0         # kick pulse height (0..1, decays)
+        self._ap_snare_timer = 0.0         # seconds left of snare color flip
+        self._ap_last_render_t = None      # last t this renderer was called with
+
         # Playback / IPC state
         self.playback_position = 0.0
         self.playback_duration = 0.0
@@ -345,6 +366,7 @@ class DmxEngineBase:
             "abyssal_bloom": self._render_abyssal_bloom,
             "golden_anthem": self._render_golden_anthem,
             "cinematic_swell": self._render_cinematic_swell,
+            "ambient_pulse": self._render_ambient_pulse,
         }
 
     def _init_hardware(self):
@@ -1081,6 +1103,71 @@ class DmxEngineBase:
                  (CINE_PEAK_MAX - CINE_WHITE_KNEE) * dimmer)
         self.out_w = ema(self.out_w, white, 0.08, 0.06)
         self.out_master = ema(self.out_master, 255.0 * brightness, 0.08, 0.05)
+        self.out_strobe = 0
+
+    def _render_ambient_pulse(self, kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
+                              kick_color, accent_color, volume, cue, t):
+        """Beat-locked ambient: layered multi-band response. Kicks snap master
+        to the graded velocity level and decay from THAT level (no hold
+        plateau -- double-pulse lesson); snares flip the wash toward the
+        accent color without touching master; hi-hats spark the white channel;
+        sustained mids breathe a never-dark floor. Accumulated dt: seeks and
+        rotation re-entry advance timers by at most one nominal frame."""
+        dimmer = (cue.get("dimmer", 60) if cue else 60) / 100.0
+
+        if (self._ap_last_render_t is None or
+                abs(t - self._ap_last_render_t) > PULSE_DISCONTINUITY_THRESHOLD):
+            dt = 0.012
+        else:
+            dt = min(max(t - self._ap_last_render_t, 0.0), PULSE_DT_CLAMP)
+        self._ap_last_render_t = t
+
+        # -- Layer 1: mid-driven breathing floor with slow color drift.
+        self._ap_floor_energy = ema(self._ap_floor_energy, min(1.0, mid_i), 0.05, 0.02)
+        # Floor is NOT dimmer-scaled (PWM-visibility lesson from abyssal_bloom).
+        floor_b = PULSE_FLOOR_MIN + self._ap_floor_energy * (PULSE_FLOOR_MAX - PULSE_FLOOR_MIN)
+        self._ap_drift_phase = (self._ap_drift_phase + dt / PULSE_DRIFT_PERIOD_S) % 1.0
+        tri = 1.0 - abs(2.0 * self._ap_drift_phase - 1.0)
+        base_color = lerp_color(kick_color, accent_color, tri * 0.7)
+
+        # -- Layer 3: snare color flip (color event only, master untouched).
+        if is_snare and not is_kick:
+            self._ap_snare_timer = PULSE_SNARE_FLIP_S
+        if self._ap_snare_timer > 0.0:
+            self._ap_snare_timer = max(0.0, self._ap_snare_timer - dt)
+            base_color = lerp_color(base_color, accent_color,
+                                    self._ap_snare_timer / PULSE_SNARE_FLIP_S)
+
+        # -- Layer 2: kick pulse. Graded by threshold-excess velocity; decays
+        # exponentially from its own hit level toward the floor.
+        if is_kick:
+            self._ap_pulse_level = max(self._ap_pulse_level,
+                                       velocity_brightness(self._beat_velocity) / 255.0)
+        else:
+            self._ap_pulse_level *= (1.0 - PULSE_KICK_DECAY)
+            if self._ap_pulse_level < 0.01:
+                self._ap_pulse_level = 0.0
+        brightness = max(floor_b, self._ap_pulse_level * dimmer)
+
+        # -- Layer 4: hi-hat shimmer (sparkle, never a wash).
+        if hihat_i > PULSE_HIHAT_THRESH:
+            self.out_w = max(self.out_w, PULSE_WHITE_SPIKE * dimmer)
+        else:
+            self.out_w *= 0.5
+
+        # Color channels: crisp attack on kick frames, smooth otherwise.
+        att = 0.9 if is_kick else 0.25
+        self.out_r = ema(self.out_r, base_color[0] * brightness, att, 0.15)
+        self.out_g = ema(self.out_g, base_color[1] * brightness, att, 0.15)
+        self.out_b = ema(self.out_b, base_color[2] * brightness, att, 0.15)
+        # Master: instant snap on the kick frame (sync feel), smooth follow after.
+        # Decay 0.08 (not 0.12): the post-kick fall must stay slower than the
+        # breathing floor's upward EMA creep, or master lands on the
+        # still-rising floor target and micro-steps up (monotone-decay pin).
+        if is_kick:
+            self.out_master = 255.0 * brightness
+        else:
+            self.out_master = ema(self.out_master, 255.0 * brightness, 0.3, 0.08)
         self.out_strobe = 0
 
     def load_ai_show(self, show_file="current_show.json"):
