@@ -116,6 +116,39 @@ def test_discontinuity_guard_on_seek():
     assert abs(eng._ap_drift_phase - drift_before) < 0.002
 
 
+def test_kick_visible_over_loud_floor():
+    # F1 pin: at dimmer 50 with loud mids (floor at PULSE_FLOOR_MAX), max()
+    # compositing swallowed sub-floor pulses (soft kick delta 0.0, mid 4.5).
+    # Additive compositing must keep every kick visible over any floor.
+    def hit_delta(v):
+        eng = make_engine()
+        t = 0.0
+        for _ in range(300):
+            frame(eng, t, mid_i=1.0, dimmer=50)
+            t += 0.012
+        settled = eng.out_master
+        frame(eng, t, kick=True, velocity=v, mid_i=1.0, dimmer=50)
+        return eng.out_master - settled
+    assert hit_delta(0.2) > 15.0                   # soft kick still visible
+    assert hit_delta(0.5) > 30.0                   # mid kick clearly visible
+
+
+def test_no_phantom_pulse_on_reentry():
+    eng = make_engine()
+    t = settle(eng)
+    floor_master = eng.out_master
+    frame(eng, t, kick=True, velocity=1.0)
+    t += 0.012
+    frame(eng, t)
+    t += 0.012
+    frame(eng, t)
+    # Simulate 60s rotated away: another renderer drove the lights back down
+    # to ambient levels; only this renderer's private state is stale.
+    eng.out_master = floor_master
+    frame(eng, t + 60.0)                           # discontinuity, no kick
+    assert abs(eng.out_master - floor_master) < 20.0   # no stale-hit replay
+
+
 def test_registered_in_engine():
     assert "ambient_pulse" in VALID_BEHAVIORS
     eng = make_engine()

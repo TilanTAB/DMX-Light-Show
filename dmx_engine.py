@@ -1111,13 +1111,20 @@ class DmxEngineBase:
         to the graded velocity level and decay from THAT level (no hold
         plateau -- double-pulse lesson); snares flip the wash toward the
         accent color without touching master; hi-hats spark the white channel;
-        sustained mids breathe a never-dark floor. Accumulated dt: seeks and
-        rotation re-entry advance timers by at most one nominal frame."""
+        sustained mids breathe a never-dark floor. Drift/snare timers are
+        accumulated-dt (seek/re-entry immune); kick and white decays are
+        per-frame at the fixed block rate. Layers below are numbered per the
+        spec but ordered by data dependency (snare tints base_color before
+        the rgb write; kick computes brightness after the floor)."""
         dimmer = (cue.get("dimmer", 60) if cue else 60) / 100.0
 
         if (self._ap_last_render_t is None or
                 abs(t - self._ap_last_render_t) > PULSE_DISCONTINUITY_THRESHOLD):
             dt = 0.012
+            # Re-entry must not replay a stale hit: a pulse armed before we
+            # were deselected would otherwise flash at full height now.
+            self._ap_pulse_level = 0.0
+            self._ap_snare_timer = 0.0
         else:
             dt = min(max(t - self._ap_last_render_t, 0.0), PULSE_DT_CLAMP)
         self._ap_last_render_t = t
@@ -1147,7 +1154,10 @@ class DmxEngineBase:
             self._ap_pulse_level *= (1.0 - PULSE_KICK_DECAY)
             if self._ap_pulse_level < 0.01:
                 self._ap_pulse_level = 0.0
-        brightness = max(floor_b, self._ap_pulse_level * dimmer)
+        # Additive compositing: max() swallowed sub-floor pulses entirely
+        # (soft kick over a loud floor at dimmer 50 changed output by 0.0) --
+        # additive keeps every kick visible over any floor, capped at 1.0.
+        brightness = min(1.0, floor_b + self._ap_pulse_level * dimmer * (1.0 - floor_b))
 
         # -- Layer 4: hi-hat shimmer (sparkle, never a wash).
         if hihat_i > PULSE_HIHAT_THRESH:
