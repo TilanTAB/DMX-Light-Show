@@ -9,7 +9,7 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
                         LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
-                        DRY_RUN)
+                        DRY_RUN, VALID_BEHAVIORS)
 from dmx_variety import Intent
 from dmx_punch import beat_velocity_from_ratio
 
@@ -38,6 +38,10 @@ class DMXEngine(DmxEngineBase):
         self.profile_glow_thresh = 0.55
         self.profile_beat_hold = 4
         self.profile_deep_bass_hold = 5
+        # Optional: pin the dispatch to one renderer (profile "force_behavior"
+        # key). None = auto-behavior detection as always. Added after Cinematic
+        # hardware feedback: tuning-only profiles cannot guarantee a mode feel.
+        self.profile_force_behavior = None
         # Loopback runtime state
         self.loopback_ambient = True
         self.volume_history = deque(maxlen=200)
@@ -71,6 +75,14 @@ class DMXEngine(DmxEngineBase):
             self.profile_beat_hold = p.get("beat_hold_frames", self.profile_beat_hold)
             self.profile_deep_bass_hold = p.get("deep_bass_hold_frames", self.profile_deep_bass_hold)
             self.profile_kick_dominance_ratio = p.get("kick_dominance_ratio", self.profile_kick_dominance_ratio)
+            forced = p.get("force_behavior", None)
+            if forced is not None:
+                if forced in VALID_BEHAVIORS:
+                    self.profile_force_behavior = forced
+                else:
+                    logger.warning(f"[PROFILE] Unknown force_behavior '{forced}' "
+                                   "-- falling back to auto-behavior detection")
+                    self.profile_force_behavior = None
             # Load palettes if provided
             if "palettes" in p:
                 self.palettes = [(tuple(c1), tuple(c2)) for c1, c2 in p["palettes"]]
@@ -146,7 +158,7 @@ class DMXEngine(DmxEngineBase):
                 # Very quiet — rotate through ambient behaviors for variety
                 ambient_pool = ["ocean_drift", "candlelight", "aurora_shimmer",
                                "sunset_fade", "abyssal_bloom", "golden_anthem",
-                               "cinematic_swell"]
+                               "cinematic_swell", "ambient_pulse"]
                 ambient_idx = int(current_time / 15.0) % len(ambient_pool)  # Switch every 15s
                 return ambient_pool[ambient_idx]
             elif beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7:
@@ -299,7 +311,11 @@ class DMXEngine(DmxEngineBase):
         kick_color, accent_color, combo_color = self.variety.current_colors()
 
         # ── Auto-behavior detection: picks chill or punchy ──
+        # Always runs (keeps the energy state machine + Intent mood fresh);
+        # a profile force_behavior overrides only the CHOICE, never the machine.
         auto_behavior = self._detect_auto_behavior(volume, kick_i, snare_i, current_time, beats_per_sec)
+        if self.profile_force_behavior:
+            auto_behavior = self.profile_force_behavior
         self.current_behavior = auto_behavior
 
         # Write IPC state every ~50 frames (~1s) so the UI shows the sub-mode
@@ -311,11 +327,15 @@ class DMXEngine(DmxEngineBase):
         # Ambient/chill behaviors → use the standard renderer dispatch
         ambient_behaviors = {"ocean_drift", "candlelight", "sunset_fade",
                              "aurora_shimmer", "abyssal_bloom", "golden_anthem", "cinematic_swell",
+                             "ambient_pulse",
                              "slow_breathe",
                              "static_wash", "buildup_ramp", "rainbow_sweep"}
 
         if auto_behavior in ambient_behaviors:
-            cue = {"dimmer": 50, "energy": 3, "start": 0, "end": 60,
+            # ambient_pulse is the beat-locked mode -- it needs pulse headroom,
+            # not the dim ambient default.
+            cue_dimmer = 80 if auto_behavior == "ambient_pulse" else 50
+            cue = {"dimmer": cue_dimmer, "energy": 3, "start": 0, "end": 60,
                     "strobe": False, "fade": 3.0}
             renderer = self._behavior_map.get(auto_behavior, self._render_beat_reactive)
             renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,

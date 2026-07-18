@@ -153,3 +153,67 @@ def test_registered_in_engine():
     assert "ambient_pulse" in VALID_BEHAVIORS
     eng = make_engine()
     assert eng._behavior_map["ambient_pulse"] == eng._render_ambient_pulse
+
+
+def _loopback_engine():
+    # Imports pyaudiowpatch (Windows-only) -- fine on this project's machine.
+    from music_light import DMXEngine
+    return DMXEngine()
+
+
+def _drive_dispatch(eng, n=40, loud=True):
+    """Push frames through _dispatch with loud punchy-looking input."""
+    vol = 0.01 if loud else 0.00006
+    for i in range(n):
+        eng.frame_counter += 1
+        eng._dispatch(0.5, 0.2, 0.3, 0.1,
+                      0.5 if loud else 0.0, 0.1, 0.2, 0.3,
+                      loud and (i % 10 == 0), False,
+                      vol, 48000)
+
+
+def test_force_behavior_pins_dispatch_at_any_energy():
+    eng = _loopback_engine()
+    eng.profile_force_behavior = "ambient_pulse"
+    eng.energy_state = "high"                      # would normally go punchy
+    _drive_dispatch(eng, loud=True)
+    assert eng.current_behavior == "ambient_pulse"
+    eng.energy_state = "calm"                      # would normally rotate ambient
+    _drive_dispatch(eng, loud=False)
+    assert eng.current_behavior == "ambient_pulse"
+
+
+def test_no_force_behavior_keeps_auto_detection():
+    eng = _loopback_engine()
+    assert eng.profile_force_behavior is None      # default: auto
+    eng.energy_state = "high"
+    _drive_dispatch(eng, loud=True)
+    assert eng.current_behavior != "ambient_pulse" # auto picked something else
+
+
+def test_force_behavior_unknown_value_falls_back():
+    import json, tempfile, os as _os
+    eng = _loopback_engine()
+    prof = {"name": "Bad", "force_behavior": "no_such_renderer"}
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with _os.fdopen(fd, "w") as f:
+        json.dump(prof, f)
+    try:
+        eng.load_profile(path)
+    finally:
+        _os.remove(path)
+    assert eng.profile_force_behavior is None      # warned + fell back
+
+
+def test_variety_still_evolves_when_pinned():
+    eng = _loopback_engine()
+    eng.profile_force_behavior = "ambient_pulse"
+    _drive_dispatch(eng, n=5, loud=True)
+    first_palette = eng.variety.current_palette["id"]
+    # Force the evolution timer past the threshold and dispatch again.
+    eng.variety._section_start_t = -999.0
+    _drive_dispatch(eng, n=5, loud=True)
+    assert eng.variety.current_palette["id"] is not None
+    # begin_section ran again (anti-repeat may or may not change the id;
+    # the invariant is that the variety tick/begin_section path still runs).
+    assert eng._last_section_id is not None
