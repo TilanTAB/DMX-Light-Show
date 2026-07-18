@@ -244,3 +244,28 @@ def test_variety_still_evolves_when_pinned():
     # proves the force_evolve path still executes under pinning. Would fail
     # if pinning short-circuited the variety tick/begin_section path.
     assert eng.variety._section_start_t > -900.0
+
+
+def test_registered_in_llm_designer_repair_gate():
+    import llm_designer
+    assert "ambient_pulse" in llm_designer.VALID_BEHAVIORS
+    plan = {"show_name": "t", "cues": [{
+        "start_time": 0, "end_time": 10,
+        "color_1": [20, 60, 255], "color_2": [255, 0, 180],
+        "energy": 5, "strobe": False, "behavior": "ambient_pulse",
+        "dimmer": 80, "fade_in": 1, "fade_out": 1,
+        "section_name": "groove", "mood": "cool"}]}
+    out = llm_designer._validate_and_repair_plan(plan)
+    assert out["cues"][0]["behavior"] == "ambient_pulse"
+
+
+def test_pinnable_set_is_subset_of_valid_behaviors():
+    # Two hand-maintained name lists: a renderer added to dmx_engine's
+    # VALID_BEHAVIORS/_behavior_map but forgotten in music_light's
+    # AMBIENT_DISPATCH_BEHAVIORS silently becomes unpinnable.
+    import music_light
+    from dmx_engine import VALID_BEHAVIORS as ENGINE_VALID
+    assert music_light.AMBIENT_DISPATCH_BEHAVIORS <= ENGINE_VALID
+    eng = music_light.DMXEngine()
+    for name in music_light.AMBIENT_DISPATCH_BEHAVIORS:
+        assert name in eng._behavior_map
