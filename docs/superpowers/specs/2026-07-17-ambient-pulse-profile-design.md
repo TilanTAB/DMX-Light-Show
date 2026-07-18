@@ -76,7 +76,8 @@ State in `DmxEngineBase.__init__` (beside `_cs_*`): `_ap_floor_energy` (mid EMA)
 
 - Full suite green (59 existing + new).
 - Dry-run determinism ×2 with an ambient_pulse cue.
-- Hardware pass (user): pick "Ambient Pulse", play an EDM track at normal volume — lights must visibly track kicks (graded), snares flip color, hi-hats sparkle; no dropouts to unrelated ambient renderers at any volume.
+- Hardware pass (user): pick "Ambient Pulse", play an EDM track at normal volume — lights must visibly track kicks, snares flip color, hi-hats sparkle; no dropouts to unrelated ambient renderers at any volume.
+  - **Grading amendment (2026-07-18, from Task 3 quality review):** at this profile's `kick_thresh` 0.06, the threshold-excess velocity saturates for any `kick_i ≥ 0.18`, so **loopback pulses are effectively uniform full-height** — "every kick pulses hard," which fits the festival-wash intent. True per-hit grading applies in **synced mode** (default thresh 0.3, where the measured median kick ratio 1.42 → velocity ≈ 0.21). If loopback grading is wanted later, the knobs are `kick_thresh` (raise) or a per-profile full-ratio (new key).
 
 ## Risks
 

@@ -260,9 +260,13 @@ def test_registered_in_llm_designer_repair_gate():
 
 
 def test_pinnable_set_is_subset_of_valid_behaviors():
-    # Two hand-maintained name lists: a renderer added to dmx_engine's
-    # VALID_BEHAVIORS/_behavior_map but forgotten in music_light's
-    # AMBIENT_DISPATCH_BEHAVIORS silently becomes unpinnable.
+    # Pins one direction of the two hand-maintained name lists: every
+    # pinnable name must be engine-valid AND actually dispatchable via
+    # _behavior_map (a stale entry here would pin to a renderer that
+    # cannot run). NOTE: the reverse drift -- a NEW ambient renderer
+    # forgotten in AMBIENT_DISPATCH_BEHAVIORS and thus unpinnable -- is
+    # NOT catchable by a subset check; guarding it needs an authoritative
+    # ambient-renderer list in dmx_engine (deferred).
     import music_light
     from dmx_engine import VALID_BEHAVIORS as ENGINE_VALID
     assert music_light.AMBIENT_DISPATCH_BEHAVIORS <= ENGINE_VALID
