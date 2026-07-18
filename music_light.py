@@ -9,11 +9,22 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
                         LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
-                        DRY_RUN, VALID_BEHAVIORS)
+                        DRY_RUN)
 from dmx_variety import Intent
 from dmx_punch import beat_velocity_from_ratio
 
 logger = logging.getLogger(__name__)
+
+# Behaviors the loopback _dispatch can deliver BY NAME (routed through
+# _behavior_map). Everything else (the punchy set) collapses into
+# _render_loopback_direct, which ignores the behavior name -- so pinning a
+# punchy name would report a renderer that isn't actually running. Used by
+# both _dispatch routing and load_profile force_behavior validation.
+AMBIENT_DISPATCH_BEHAVIORS = {"ocean_drift", "candlelight", "sunset_fade",
+                              "aurora_shimmer", "abyssal_bloom", "golden_anthem",
+                              "cinematic_swell", "ambient_pulse",
+                              "slow_breathe",
+                              "static_wash", "buildup_ramp", "rainbow_sweep"}
 
 
 class DMXEngine(DmxEngineBase):
@@ -76,13 +87,14 @@ class DMXEngine(DmxEngineBase):
             self.profile_deep_bass_hold = p.get("deep_bass_hold_frames", self.profile_deep_bass_hold)
             self.profile_kick_dominance_ratio = p.get("kick_dominance_ratio", self.profile_kick_dominance_ratio)
             forced = p.get("force_behavior", None)
-            if forced is not None:
-                if forced in VALID_BEHAVIORS:
-                    self.profile_force_behavior = forced
-                else:
-                    logger.warning(f"[PROFILE] Unknown force_behavior '{forced}' "
-                                   "-- falling back to auto-behavior detection")
-                    self.profile_force_behavior = None
+            if forced is not None and forced not in AMBIENT_DISPATCH_BEHAVIORS:
+                logger.warning(f"[PROFILE] force_behavior '{forced}' is not "
+                               "supported for pinning (only per-name ambient "
+                               "renderers are) -- falling back to auto-behavior "
+                               "detection")
+            # Unconditional: a reload without the key (or with a bad value)
+            # must clear any stale pin from a previously loaded profile.
+            self.profile_force_behavior = forced if forced in AMBIENT_DISPATCH_BEHAVIORS else None
             # Load palettes if provided
             if "palettes" in p:
                 self.palettes = [(tuple(c1), tuple(c2)) for c1, c2 in p["palettes"]]
@@ -325,13 +337,7 @@ class DMXEngine(DmxEngineBase):
             self._write_playback_state()
 
         # Ambient/chill behaviors → use the standard renderer dispatch
-        ambient_behaviors = {"ocean_drift", "candlelight", "sunset_fade",
-                             "aurora_shimmer", "abyssal_bloom", "golden_anthem", "cinematic_swell",
-                             "ambient_pulse",
-                             "slow_breathe",
-                             "static_wash", "buildup_ramp", "rainbow_sweep"}
-
-        if auto_behavior in ambient_behaviors:
+        if auto_behavior in AMBIENT_DISPATCH_BEHAVIORS:
             # ambient_pulse is the beat-locked mode -- it needs pulse headroom,
             # not the dim ambient default.
             cue_dimmer = 80 if auto_behavior == "ambient_pulse" else 50

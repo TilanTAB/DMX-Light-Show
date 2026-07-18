@@ -157,8 +157,15 @@ def test_registered_in_engine():
 
 def _loopback_engine():
     # Imports pyaudiowpatch (Windows-only) -- fine on this project's machine.
+    import tempfile
     from music_light import DMXEngine
-    return DMXEngine()
+    eng = DMXEngine()
+    # Redirect IPC files to temp: driving _dispatch past frame_counter 50
+    # triggers _write_playback_state, which must not clobber the repo's
+    # tracked playback_state.json.
+    eng._state_file = os.path.join(tempfile.gettempdir(), "test_playback_state.json")
+    eng._command_file = os.path.join(tempfile.gettempdir(), "test_playback_command.json")
+    return eng
 
 
 def _drive_dispatch(eng, n=40, loud=True):
@@ -178,23 +185,28 @@ def test_force_behavior_pins_dispatch_at_any_energy():
     eng.energy_state = "high"                      # would normally go punchy
     _drive_dispatch(eng, loud=True)
     assert eng.current_behavior == "ambient_pulse"
+    # Not just the label: the pinned renderer actually ran (its private
+    # accumulated-dt state only moves inside _render_ambient_pulse).
+    assert eng._ap_last_render_t is not None
     eng.energy_state = "calm"                      # would normally rotate ambient
     _drive_dispatch(eng, loud=False)
     assert eng.current_behavior == "ambient_pulse"
 
 
 def test_no_force_behavior_keeps_auto_detection():
+    import time as _time
     eng = _loopback_engine()
     assert eng.profile_force_behavior is None      # default: auto
     eng.energy_state = "high"
+    # Fresh state timestamp: keeps the state machine from instantly demoting
+    # "high" on the huge time_in_state a zero epoch would imply.
+    eng.energy_state_since = _time.time()
     _drive_dispatch(eng, loud=True)
     assert eng.current_behavior != "ambient_pulse" # auto picked something else
 
 
-def test_force_behavior_unknown_value_falls_back():
+def _load_profile_dict(eng, prof):
     import json, tempfile, os as _os
-    eng = _loopback_engine()
-    prof = {"name": "Bad", "force_behavior": "no_such_renderer"}
     fd, path = tempfile.mkstemp(suffix=".json")
     with _os.fdopen(fd, "w") as f:
         json.dump(prof, f)
@@ -202,18 +214,33 @@ def test_force_behavior_unknown_value_falls_back():
         eng.load_profile(path)
     finally:
         _os.remove(path)
-    assert eng.profile_force_behavior is None      # warned + fell back
+
+
+def test_force_behavior_unknown_value_falls_back():
+    # Punchy names ARE in VALID_BEHAVIORS but loopback dispatch collapses
+    # them all into _render_loopback_direct (the name is ignored) -- pinning
+    # must reject them exactly like unknown names, or the IPC label lies.
+    for bad in ("no_such_renderer", "strobe_blast"):
+        eng = _loopback_engine()
+        _load_profile_dict(eng, {"name": "Bad", "force_behavior": bad})
+        assert eng.profile_force_behavior is None  # warned + fell back
+
+
+def test_force_behavior_valid_value_loads_from_json():
+    # End-to-end through the profile JSON: pins the "force_behavior" key name.
+    eng = _loopback_engine()
+    _load_profile_dict(eng, {"name": "Good", "force_behavior": "ambient_pulse"})
+    assert eng.profile_force_behavior == "ambient_pulse"
 
 
 def test_variety_still_evolves_when_pinned():
     eng = _loopback_engine()
     eng.profile_force_behavior = "ambient_pulse"
     _drive_dispatch(eng, n=5, loud=True)
-    first_palette = eng.variety.current_palette["id"]
     # Force the evolution timer past the threshold and dispatch again.
     eng.variety._section_start_t = -999.0
     _drive_dispatch(eng, n=5, loud=True)
-    assert eng.variety.current_palette["id"] is not None
-    # begin_section ran again (anti-repeat may or may not change the id;
-    # the invariant is that the variety tick/begin_section path still runs).
-    assert eng._last_section_id is not None
+    # begin_section resets _section_start_t to the variety clock (>= 0):
+    # proves the force_evolve path still executes under pinning. Would fail
+    # if pinning short-circuited the variety tick/begin_section path.
+    assert eng.variety._section_start_t > -900.0
