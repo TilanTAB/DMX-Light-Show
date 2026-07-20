@@ -123,6 +123,9 @@ PULSE_HIHAT_THRESH = 0.5      # hihat intensity gate for shimmer
 PULSE_WHITE_SPIKE = 80.0      # white channel spike on shimmer
 PULSE_DT_CLAMP = 0.1          # max accumulated-dt advance per frame
 PULSE_DISCONTINUITY_THRESHOLD = 1.0  # bigger call-gap => one nominal frame
+PULSE_DEFAULT_DIMMER = 80     # renderer-owned headroom; every caller (loopback
+                              # dispatch, synced fallback, LLM cue default)
+                              # supplies 80 -- keep the fallback identical.
 
 # Default palettes: (kick_color, snare_color) — high contrast pairs
 DEFAULT_PALETTES = [
@@ -1118,10 +1121,11 @@ class DmxEngineBase:
         accent color without touching master; hi-hats spark the white channel;
         sustained mids breathe a never-dark floor. Drift/snare timers are
         accumulated-dt (seek/re-entry immune); kick and white decays are
-        per-frame at the fixed block rate. Layers below are numbered per the
-        spec but ordered by data dependency (snare tints base_color before
-        the rgb write; kick computes brightness after the floor)."""
-        dimmer = (cue.get("dimmer", 60) if cue else 60) / 100.0
+        per-frame at the fixed block rate. Layers are numbered in code order
+        (floor, snare tint, kick pulse, shimmer -- snare must tint base_color
+        before the rgb write; kick computes brightness after the floor)."""
+        dimmer = (cue.get("dimmer", PULSE_DEFAULT_DIMMER)
+                  if cue else PULSE_DEFAULT_DIMMER) / 100.0
 
         if (self._ap_last_render_t is None or
                 abs(t - self._ap_last_render_t) > PULSE_DISCONTINUITY_THRESHOLD):
@@ -1134,7 +1138,7 @@ class DmxEngineBase:
             dt = min(max(t - self._ap_last_render_t, 0.0), PULSE_DT_CLAMP)
         self._ap_last_render_t = t
 
-        # -- Layer 1: mid-driven breathing floor with slow color drift.
+        # -- Layer 1 (floor): mid-driven breathing floor with slow color drift.
         self._ap_floor_energy = ema(self._ap_floor_energy, min(1.0, mid_i), 0.05, 0.02)
         # Floor is NOT dimmer-scaled (PWM-visibility lesson from abyssal_bloom).
         floor_b = PULSE_FLOOR_MIN + self._ap_floor_energy * (PULSE_FLOOR_MAX - PULSE_FLOOR_MIN)
@@ -1142,7 +1146,7 @@ class DmxEngineBase:
         tri = 1.0 - abs(2.0 * self._ap_drift_phase - 1.0)
         base_color = lerp_color(kick_color, accent_color, tri * 0.7)
 
-        # -- Layer 3: snare color flip (color event only, master untouched).
+        # -- Layer 2 (snare tint): color flip only, master untouched.
         if is_snare and not is_kick:
             self._ap_snare_timer = PULSE_SNARE_FLIP_S
         if self._ap_snare_timer > 0.0:
@@ -1150,7 +1154,7 @@ class DmxEngineBase:
             base_color = lerp_color(base_color, accent_color,
                                     self._ap_snare_timer / PULSE_SNARE_FLIP_S)
 
-        # -- Layer 2: kick pulse. Graded by threshold-excess velocity; decays
+        # -- Layer 3 (kick pulse): graded by threshold-excess velocity; decays
         # exponentially from its own hit level toward the floor.
         if is_kick:
             self._ap_pulse_level = max(self._ap_pulse_level,
@@ -1164,7 +1168,7 @@ class DmxEngineBase:
         # additive keeps every kick visible over any floor, capped at 1.0.
         brightness = min(1.0, floor_b + self._ap_pulse_level * dimmer * (1.0 - floor_b))
 
-        # -- Layer 4: hi-hat shimmer (sparkle, never a wash).
+        # -- Layer 4 (shimmer): hi-hat white sparkle, never a wash.
         if hihat_i > PULSE_HIHAT_THRESH:
             self.out_w = max(self.out_w, PULSE_WHITE_SPIKE * dimmer)
         else:
@@ -1179,6 +1183,8 @@ class DmxEngineBase:
         # Decay 0.08 (not 0.12): the post-kick fall must stay slower than the
         # breathing floor's upward EMA creep, or master lands on the
         # still-rising floor target and micro-steps up (monotone-decay pin).
+        # Note: if mids RISE sharply post-kick, master legitimately follows the
+        # louder floor up (~2/255 over seconds -- imperceptible, and correct).
         if is_kick:
             self.out_master = 255.0 * brightness
         else:

@@ -65,7 +65,9 @@ There is **no `requirements.txt` or `pyproject.toml`** — the `pip install -r r
 
 ## Testing
 
-No automated tests and no test runner. The gitignored `test_*.py` files are throwaway manual hardware/API probes (some contain hardcoded credentials — never commit or extend them). Verify changes by running the app.
+A tracked pytest suite lives in `tests/` (run `.venv\Scripts\python.exe -m pytest -q` from the repo root; `pytest.ini` configures discovery, `tests/conftest.py` sets `DMX_DRY_RUN=1` before any engine import). It covers the variety/punch modules, renderer behavior (envelope math, discontinuity guards, velocity grading), profile pinning, and the LLM repair gate — extend it TDD-style when touching those areas. The engines also support an offline harness: `DMX_DRY_RUN=1` skips USB init and records frames instead of sending them (see `ai_show_player.py`'s dry-run branch for deterministic no-hardware playback verification).
+
+The gitignored `test_*.py` files at the **repo root** are a different thing: throwaway manual hardware/API probes (some contain hardcoded credentials — never commit or extend them). Hardware-feel changes still need verification by running the app on the uDMX.
 
 ## Hardware & sidecar binaries
 

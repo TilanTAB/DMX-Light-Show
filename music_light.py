@@ -9,7 +9,7 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
                         LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
-                        DRY_RUN)
+                        DRY_RUN, PULSE_DEFAULT_DIMMER)
 from dmx_variety import Intent
 from dmx_punch import beat_velocity_from_ratio
 
@@ -344,8 +344,9 @@ class DMXEngine(DmxEngineBase):
         # Ambient/chill behaviors → use the standard renderer dispatch
         if auto_behavior in AMBIENT_DISPATCH_BEHAVIORS:
             # ambient_pulse is the beat-locked mode -- it needs pulse headroom,
-            # not the dim ambient default.
-            cue_dimmer = 80 if auto_behavior == "ambient_pulse" else 50
+            # not the dim ambient default. Headroom value is renderer-owned
+            # (PULSE_DEFAULT_DIMMER) so it can't drift from the fallback.
+            cue_dimmer = PULSE_DEFAULT_DIMMER if auto_behavior == "ambient_pulse" else 50
             cue = {"dimmer": cue_dimmer, "energy": 3, "start": 0, "end": 60,
                     "strobe": False, "fade": 3.0}
             renderer = self._behavior_map.get(auto_behavior, self._render_beat_reactive)
