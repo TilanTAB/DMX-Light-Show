@@ -226,6 +226,19 @@ def test_force_behavior_unknown_value_falls_back():
         assert eng.profile_force_behavior is None  # warned + fell back
 
 
+def test_force_behavior_unhashable_value_does_not_abort_load():
+    # A non-string JSON value (natural typo: a list) is unhashable; raw set
+    # membership raised TypeError into load_profile's broad except, leaving
+    # the profile HALF-applied (palettes skipped) and a stale pin surviving.
+    eng = _loopback_engine()
+    eng.profile_force_behavior = "ambient_pulse"   # stale pin from "before"
+    _load_profile_dict(eng, {"name": "Typo",
+                             "force_behavior": ["ambient_pulse"],
+                             "palettes": [[[1, 2, 3], [4, 5, 6]]]})
+    assert eng.profile_force_behavior is None      # stale pin cleared
+    assert eng.palettes == [((1, 2, 3), (4, 5, 6))]  # rest of profile applied
+
+
 def test_force_behavior_valid_value_loads_from_json():
     # End-to-end through the profile JSON: pins the "force_behavior" key name.
     eng = _loopback_engine()

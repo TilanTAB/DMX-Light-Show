@@ -141,7 +141,10 @@ def test_discontinuity_guard_on_seek():
     # One nominal frame of drift is 0.012/20 = 0.0006 -- the DT clamp alone
     # (0.1/20 = 0.005) would fail this bound; only the guard passes it.
     assert abs(eng._cs_drift_phase - drift_before) < 0.002
-    assert eng._cs_swell_age - age_before <= 0.013
+    # Post-review fix: the guard now CLEARS an armed swell on discontinuity
+    # (ambient_pulse precedent) -- stronger than the old "advances <= one
+    # nominal frame" bound, which let a stale swell resume mid-envelope.
+    assert eng._cs_swell_age is None
 
 
 def test_floor_never_dark_at_dimmer_zero():
@@ -183,3 +186,21 @@ def test_registered_in_llm_designer_repair_gate():
         "section_name": "intro", "mood": "dark"}]}
     out = llm_designer._validate_and_repair_plan(plan)
     assert out["cues"][0]["behavior"] == "cinematic_swell"
+
+
+def test_no_phantom_swell_on_reentry():
+    # A swell armed just before rotation/seek deselection must NOT resume
+    # mid-envelope on re-entry (the ambient_pulse "stale hit" precedent).
+    # Pre-fix: the guard reset dt only, and a re-entry 60s later replayed
+    # the armed swell at full height (+107 master, simulated).
+    eng = make_engine()
+    run_frames(eng, 50)                                    # settle at floor
+    floor_master = eng.out_master
+    # Arm a swell with a strong kick (ratio 3.5 at thresh 0.10), two frames.
+    t = run_frames(eng, 2, t0=0.6, kick_i=0.35, kick_first=True)
+    assert eng._cs_swell_age is not None                   # armed
+    # Rotate away 60s; other renderers drove the lights meanwhile.
+    eng.out_master = floor_master
+    for i in range(200):                                   # 2.4s of re-entry
+        run_frames(eng, 1, t0=t + 60.0 + i * 0.012)
+        assert eng.out_master < floor_master + 20.0        # no phantom swell

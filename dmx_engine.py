@@ -1044,6 +1044,11 @@ class DmxEngineBase:
         if (self._cs_last_render_t is None or
                 abs(t - self._cs_last_render_t) > CINE_DISCONTINUITY_THRESHOLD):
             dt = 0.012
+            # Re-entry must not replay a stale hit (ambient_pulse precedent):
+            # a swell armed just before deselection would otherwise resume
+            # mid-envelope on return, a phantom swell with no audio event.
+            self._cs_swell_age = None
+            self._cs_swell_peak = 0.0
         else:
             dt = min(max(t - self._cs_last_render_t, 0.0), CINE_DT_CLAMP)
         self._cs_last_render_t = t

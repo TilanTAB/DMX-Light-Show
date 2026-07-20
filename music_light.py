@@ -87,14 +87,19 @@ class DMXEngine(DmxEngineBase):
             self.profile_deep_bass_hold = p.get("deep_bass_hold_frames", self.profile_deep_bass_hold)
             self.profile_kick_dominance_ratio = p.get("kick_dominance_ratio", self.profile_kick_dominance_ratio)
             forced = p.get("force_behavior", None)
-            if forced is not None and forced not in AMBIENT_DISPATCH_BEHAVIORS:
-                logger.warning(f"[PROFILE] force_behavior '{forced}' is not "
+            # isinstance guard: a non-string JSON value (list/dict typo) is
+            # unhashable -- raw set membership would raise TypeError into the
+            # broad except below, aborting palette loading AND skipping the
+            # stale-pin clear. Validate type first, test membership once.
+            pin_valid = isinstance(forced, str) and forced in AMBIENT_DISPATCH_BEHAVIORS
+            if forced is not None and not pin_valid:
+                logger.warning(f"[PROFILE] force_behavior {forced!r} is not "
                                "supported for pinning (only per-name ambient "
                                "renderers are) -- falling back to auto-behavior "
                                "detection")
             # Unconditional: a reload without the key (or with a bad value)
             # must clear any stale pin from a previously loaded profile.
-            self.profile_force_behavior = forced if forced in AMBIENT_DISPATCH_BEHAVIORS else None
+            self.profile_force_behavior = forced if pin_valid else None
             # Load palettes if provided
             if "palettes" in p:
                 self.palettes = [(tuple(c1), tuple(c2)) for c1, c2 in p["palettes"]]
