@@ -317,6 +317,10 @@ Use these for quiet sections, breakdowns, lo-fi, acoustic, and ambient music.
   USE FOR: Cinematic tension-building sections, dramatic intros, half-time or stripped-back breakdowns, trailer-style moments.
   FEEL: Widescreen, slow-motion impact. Every hit feels earned.
 
+"ambient_pulse" — Gentle colored wash that visibly follows the music: kicks pulse the brightness (graded by hit strength), snares flip the wash toward the accent color, hi-hats add brief white sparkles, sustained melody breathes the floor. Beat-locked but never harsh.
+  USE FOR: Verses, grooves, melodic mid-energy sections, any part that needs the lights "dancing along" without full punch.
+  FEEL: Festival wash breathing with the groove. Alive, connected, gentle.
+
 === NARRATIVE ARC TEMPLATE ===
 A well-designed show follows this emotional curve:
   Intro: ocean_drift or aurora_shimmer (gentle, mysterious)
@@ -458,7 +462,7 @@ VALID_BEHAVIORS = {
     "beat_reactive", "bass_white_blast", "blackout_punch",
     # Ambient/chill behaviors
     "ocean_drift", "candlelight", "sunset_fade", "aurora_shimmer", "abyssal_bloom",
-    "golden_anthem", "cinematic_swell",
+    "golden_anthem", "cinematic_swell", "ambient_pulse",
 }
 
 

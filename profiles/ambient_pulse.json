@@ -1,0 +1,26 @@
+{
+    "name": "Ambient Pulse",
+    "description": "Chill-ambient colors that genuinely follow the beat. Kicks pulse the wash, snares flip the color, hi-hats sparkle white, quiet passages breathe. Tomorrowland feel at living-room volume.",
+    "force_behavior": "ambient_pulse",
+    "gain_boost": 45.0,
+    "volume_gate": 0.00005,
+    "agc_thresh": 0.35,
+    "kick_thresh": 0.06,
+    "snare_thresh": 0.09,
+    "onset_cooldown": 0.12,
+    "palettes": [
+        [ [20, 60, 255], [255, 0, 180] ],
+        [ [140, 0, 255], [0, 220, 255] ],
+        [ [255, 40, 120], [255, 190, 40] ],
+        [ [0, 200, 180], [120, 40, 255] ]
+    ],
+    "color_cycle_mode": "time",
+    "color_cycle_interval": 8.0,
+    "rhythm_change_pct": 0.50,
+    "deep_bass_enabled": false,
+    "deep_bass_thresh": 0.80,
+    "decay_speed": 0.85,
+    "glow_thresh": 0.40,
+    "beat_hold_frames": 4,
+    "deep_bass_hold_frames": 4
+}

@@ -9,11 +9,22 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from dmx_engine import (DmxEngineBase, BLOCK_SIZE, MIN_VOLUME_GATE,
                         LOOPBACK_GAIN_BOOST, LOOPBACK_VOLUME_GATE, LOOPBACK_AGC_THRESH,
-                        DRY_RUN)
+                        DRY_RUN, PULSE_DEFAULT_DIMMER)
 from dmx_variety import Intent
 from dmx_punch import beat_velocity_from_ratio
 
 logger = logging.getLogger(__name__)
+
+# Behaviors the loopback _dispatch can deliver BY NAME (routed through
+# _behavior_map). Everything else (the punchy set) collapses into
+# _render_loopback_direct, which ignores the behavior name -- so pinning a
+# punchy name would report a renderer that isn't actually running. Used by
+# both _dispatch routing and load_profile force_behavior validation.
+AMBIENT_DISPATCH_BEHAVIORS = {"ocean_drift", "candlelight", "sunset_fade",
+                              "aurora_shimmer", "abyssal_bloom", "golden_anthem",
+                              "cinematic_swell", "ambient_pulse",
+                              "slow_breathe",
+                              "static_wash", "buildup_ramp", "rainbow_sweep"}
 
 
 class DMXEngine(DmxEngineBase):
@@ -38,6 +49,10 @@ class DMXEngine(DmxEngineBase):
         self.profile_glow_thresh = 0.55
         self.profile_beat_hold = 4
         self.profile_deep_bass_hold = 5
+        # Optional: pin the dispatch to one renderer (profile "force_behavior"
+        # key). None = auto-behavior detection as always. Added after Cinematic
+        # hardware feedback: tuning-only profiles cannot guarantee a mode feel.
+        self.profile_force_behavior = None
         # Loopback runtime state
         self.loopback_ambient = True
         self.volume_history = deque(maxlen=200)
@@ -71,6 +86,20 @@ class DMXEngine(DmxEngineBase):
             self.profile_beat_hold = p.get("beat_hold_frames", self.profile_beat_hold)
             self.profile_deep_bass_hold = p.get("deep_bass_hold_frames", self.profile_deep_bass_hold)
             self.profile_kick_dominance_ratio = p.get("kick_dominance_ratio", self.profile_kick_dominance_ratio)
+            forced = p.get("force_behavior", None)
+            # isinstance guard: a non-string JSON value (list/dict typo) is
+            # unhashable -- raw set membership would raise TypeError into the
+            # broad except below, aborting palette loading AND skipping the
+            # stale-pin clear. Validate type first, test membership once.
+            pin_valid = isinstance(forced, str) and forced in AMBIENT_DISPATCH_BEHAVIORS
+            if forced is not None and not pin_valid:
+                logger.warning(f"[PROFILE] force_behavior {forced!r} is not "
+                               "supported for pinning (only per-name ambient "
+                               "renderers are) -- falling back to auto-behavior "
+                               "detection")
+            # Unconditional: a reload without the key (or with a bad value)
+            # must clear any stale pin from a previously loaded profile.
+            self.profile_force_behavior = forced if pin_valid else None
             # Load palettes if provided
             if "palettes" in p:
                 self.palettes = [(tuple(c1), tuple(c2)) for c1, c2 in p["palettes"]]
@@ -146,7 +175,7 @@ class DMXEngine(DmxEngineBase):
                 # Very quiet — rotate through ambient behaviors for variety
                 ambient_pool = ["ocean_drift", "candlelight", "aurora_shimmer",
                                "sunset_fade", "abyssal_bloom", "golden_anthem",
-                               "cinematic_swell"]
+                               "cinematic_swell", "ambient_pulse"]
                 ambient_idx = int(current_time / 15.0) % len(ambient_pool)  # Switch every 15s
                 return ambient_pool[ambient_idx]
             elif beats_per_sec < 1.0 and recent_energy < overall_avg * 0.7:
@@ -299,7 +328,11 @@ class DMXEngine(DmxEngineBase):
         kick_color, accent_color, combo_color = self.variety.current_colors()
 
         # ── Auto-behavior detection: picks chill or punchy ──
+        # Always runs (keeps the energy state machine + Intent mood fresh);
+        # a profile force_behavior overrides only the CHOICE, never the machine.
         auto_behavior = self._detect_auto_behavior(volume, kick_i, snare_i, current_time, beats_per_sec)
+        if self.profile_force_behavior:
+            auto_behavior = self.profile_force_behavior
         self.current_behavior = auto_behavior
 
         # Write IPC state every ~50 frames (~1s) so the UI shows the sub-mode
@@ -309,13 +342,12 @@ class DMXEngine(DmxEngineBase):
             self._write_playback_state()
 
         # Ambient/chill behaviors → use the standard renderer dispatch
-        ambient_behaviors = {"ocean_drift", "candlelight", "sunset_fade",
-                             "aurora_shimmer", "abyssal_bloom", "golden_anthem", "cinematic_swell",
-                             "slow_breathe",
-                             "static_wash", "buildup_ramp", "rainbow_sweep"}
-
-        if auto_behavior in ambient_behaviors:
-            cue = {"dimmer": 50, "energy": 3, "start": 0, "end": 60,
+        if auto_behavior in AMBIENT_DISPATCH_BEHAVIORS:
+            # ambient_pulse is the beat-locked mode -- it needs pulse headroom,
+            # not the dim ambient default. Headroom value is renderer-owned
+            # (PULSE_DEFAULT_DIMMER) so it can't drift from the fallback.
+            cue_dimmer = PULSE_DEFAULT_DIMMER if auto_behavior == "ambient_pulse" else 50
+            cue = {"dimmer": cue_dimmer, "energy": 3, "start": 0, "end": 60,
                     "strobe": False, "fade": 3.0}
             renderer = self._behavior_map.get(auto_behavior, self._render_beat_reactive)
             renderer(kick_i, snare_i, hihat_i, mid_i, is_kick, is_snare,
